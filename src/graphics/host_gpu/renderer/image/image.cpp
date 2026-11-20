@@ -14,7 +14,10 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <fmt/format.h>
+#include <vector>
+#include <vulkan/vulkan_format_traits.hpp>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
@@ -47,6 +50,42 @@ ImageCreateFlags(const GraphicContext& graphics, const ImageInfo& info, vk::Imag
 	return flags;
 }
 
+// A BC format with the same block size whose support answers for `format`, or eUndefined.
+[[nodiscard]] vk::Format SameBlockSizeFormat(vk::Format format) {
+	switch (format) {
+		case vk::Format::eBc4UnormBlock:
+		case vk::Format::eBc4SnormBlock: return vk::Format::eBc1RgbaUnormBlock;
+		case vk::Format::eBc2UnormBlock:
+		case vk::Format::eBc2SrgbBlock:
+		case vk::Format::eBc3UnormBlock:
+		case vk::Format::eBc3SrgbBlock:
+		case vk::Format::eBc5UnormBlock:
+		case vk::Format::eBc5SnormBlock:
+		case vk::Format::eBc6HUfloatBlock:
+		case vk::Format::eBc6HSfloatBlock: return vk::Format::eBc7UnormBlock;
+		default: return vk::Format::eUndefined;
+	}
+}
+
+// AMD's Windows driver rejects storage usage on some BC formats (BC5, BC6H) even through a
+// block-texel view, while accepting a format with the same block size (BC7) and creating the
+// rejected format's image without complaint. Fall back to that format's answer.
+[[nodiscard]] vk::Result QueryImageSupport(GraphicContext& graphics, vk::Format format,
+                                           vk::ImageType type, vk::ImageUsageFlags usage,
+                                           vk::ImageCreateFlags      flags,
+                                           vk::ImageFormatProperties* properties) {
+	const auto result = graphics.GetImageFormatProperties(format, type, vk::ImageTiling::eOptimal,
+	                                                      usage, flags, properties);
+	const auto proxy  = SameBlockSizeFormat(format);
+	if (result == vk::Result::eSuccess || proxy == vk::Format::eUndefined ||
+	    !(usage & vk::ImageUsageFlagBits::eStorage) ||
+	    !(flags & vk::ImageCreateFlagBits::eBlockTexelViewCompatible)) {
+		return result;
+	}
+	return graphics.GetImageFormatProperties(proxy, type, vk::ImageTiling::eOptimal, usage, flags,
+	                                         properties);
+}
+
 [[nodiscard]] bool HasFormatFeature(vk::FormatProperties      properties,
                                     vk::FormatFeatureFlagBits feature) {
 	return static_cast<bool>(properties.optimalTilingFeatures & feature);
@@ -58,10 +97,9 @@ ImageCreateFlags(const GraphicContext& graphics, const ImageInfo& info, vk::Imag
 		usage |= vk::ImageUsageFlagBits::eSampled;
 		if (graphics.supports_block_texel_view) {
 			const auto storage = usage | vk::ImageUsageFlagBits::eStorage;
-			if (graphics.GetImageFormatProperties(info.pixel_format, HostImageType(info.type),
-			                                      vk::ImageTiling::eOptimal, storage,
-			                                      ImageCreateFlags(graphics, info, storage),
-			                                      nullptr) == vk::Result::eSuccess) {
+			if (QueryImageSupport(graphics, info.pixel_format, HostImageType(info.type), storage,
+			                      ImageCreateFlags(graphics, info, storage),
+			                      nullptr) == vk::Result::eSuccess) {
 				usage = storage;
 			} else {
 				static std::atomic_flag warned = ATOMIC_FLAG_INIT;
@@ -245,6 +283,31 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	dependency.imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size());
 	dependency.pImageMemoryBarriers    = barriers.data();
 	command_buffer.pipelineBarrier2(dependency);
+}
+
+void Image::ZeroFillOnce() {
+	if (m_zero_filled || backing.image == nullptr) {
+		return;
+	}
+	m_zero_filled  = true;
+	m_scheduler.EndRendering();
+	auto command   = m_scheduler.Current().Handle();
+	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
+	vk::ImageSubresourceRange range {};
+	range.aspectMask     = FullAspectMask(backing.format);
+	range.baseMipLevel   = 0;
+	range.levelCount     = VK_REMAINING_MIP_LEVELS;
+	range.baseArrayLayer = 0;
+	range.layerCount     = VK_REMAINING_ARRAY_LAYERS;
+	if (info.IsDepth() || info.HasStencil()) {
+		const vk::ClearDepthStencilValue zero {0.0f, 0u};
+		command.clearDepthStencilImage(backing.image, vk::ImageLayout::eTransferDstOptimal, &zero, 1,
+		                               &range);
+	} else {
+		const vk::ClearColorValue zero {};
+		command.clearColorImage(backing.image, vk::ImageLayout::eTransferDstOptimal, &zero, 1,
+		                        &range);
+	}
 }
 
 void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
@@ -594,13 +657,32 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
-	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
-	                  vk::ImageLayout::eTransferDstOptimal, copy_count, copies.data());
+	ImageOps::CopyRegionsSeparately(command, source.backing.image, backing.image, copy_count,
+	                                copies.data());
 	Transit(vk::ImageLayout::eGeneral,
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
 
 namespace ImageOps {
+
+void CopyRegionsSeparately(vk::CommandBuffer command, vk::Image source, vk::Image destination,
+                           uint32_t count, const vk::ImageCopy* regions) {
+	vk::MemoryBarrier2 barrier {};
+	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+	barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+	barrier.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &barrier;
+	for (uint32_t i = 0; i < count; i++) {
+		if (i != 0) {
+			command.pipelineBarrier2(dependency);
+		}
+		command.copyImage(source, vk::ImageLayout::eTransferSrcOptimal, destination,
+		                  vk::ImageLayout::eTransferDstOptimal, 1, &regions[i]);
+	}
+}
 
 void Validate(const ImageInfo& info) {
 	ValidateOptionalRange(info.data, "data");
@@ -711,15 +793,44 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	create.samples       = vulkan_sample_count(info.samples);
 
 	vk::ImageFormatProperties properties {};
-	if (graphics.GetImageFormatProperties(create.format, create.imageType, create.tiling,
-	                                      create.usage, create.flags,
-	                                      &properties) != vk::Result::eSuccess ||
+	if (QueryImageSupport(graphics, create.format, create.imageType, create.usage, create.flags,
+	                      &properties) != vk::Result::eSuccess ||
 	    !static_cast<bool>(properties.sampleCounts & create.samples)) {
 		EXIT("image format does not support required usage: format=%d type=%d usage=0x%x "
 		     "flags=0x%x samples=%u\n",
 		     static_cast<int>(create.format), static_cast<int>(create.imageType),
 		     static_cast<vk::ImageUsageFlags::MaskType>(create.usage),
 		     static_cast<vk::ImageCreateFlags::MaskType>(create.flags), info.samples);
+	}
+
+	// List every same-size color format the device supports, so the driver knows the image is viewed
+	// in DCC-incompatible formats. AMD's Windows driver keeps DCC on mutable images without a list
+	// and shows tile-sized blocks (a checkerboard) when they are reread in another format; verified
+	// on DBZ Sparking Zero, RX 6800, Adrenalin 26.10.1. KYTY_DCC_UNSAFE=1 restores the old behavior.
+	static const bool dcc_safe = std::getenv("KYTY_DCC_UNSAFE") == nullptr;
+	std::vector<vk::Format>      view_formats;
+	vk::ImageFormatListCreateInfo format_list {};
+	if (dcc_safe && (create.flags & vk::ImageCreateFlagBits::eMutableFormat) && !info.IsBlock() &&
+	    !vk::isCompressed(create.format)) {
+		const auto size = vk::blockSize(create.format);
+		for (uint32_t raw = 1; raw <= static_cast<uint32_t>(vk::Format::eA8B8G8R8SrgbPack32) + 100u;
+		     raw++) {
+			const auto candidate = static_cast<vk::Format>(raw);
+			if (candidate > vk::Format::eAstc12x12SrgbBlock) break;
+			if (vk::isCompressed(candidate) || vk::blockSize(candidate) != size ||
+			    vk::texelsPerBlock(candidate) != 1 ||
+			    DepthAspectTransferFormat(candidate) != vk::Format::eUndefined ||
+			    !graphics.GetFormatProperties(candidate).optimalTilingFeatures) {
+				continue;
+			}
+			view_formats.push_back(candidate);
+		}
+		if (std::ranges::find(view_formats, create.format) == view_formats.end()) {
+			view_formats.push_back(create.format);
+		}
+		format_list.viewFormatCount = static_cast<uint32_t>(view_formats.size());
+		format_list.pViewFormats    = view_formats.data();
+		create.pNext                = &format_list;
 	}
 
 	if (!graphics.CreateImage(create, backing)) {

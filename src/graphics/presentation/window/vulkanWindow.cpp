@@ -422,7 +422,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	if (!add(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME)) {
 		supported.unlink<vk::PhysicalDeviceProvokingVertexFeaturesEXT>();
 	}
-	if (!add(VK_KHR_MAINTENANCE_8_EXTENSION_NAME)) {
+	// KYTY_NO_MAINT8=1 (diagnostic): behave as under RenderDoc, which hides maintenance8.
+	if (std::getenv("KYTY_NO_MAINT8") != nullptr || !add(VK_KHR_MAINTENANCE_8_EXTENSION_NAME)) {
 		supported.unlink<vk::PhysicalDeviceMaintenance8FeaturesKHR>();
 	}
 	if (!add(VK_KHR_SHADER_CLOCK_EXTENSION_NAME)) {
@@ -514,6 +515,25 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	     graphics.maintenance8_enabled ? "true" : "false");
 	LOGF("Vulkan depth feedback support: %s\n",
 	     graphics.attachment_feedback_loop_enabled ? "true" : "false");
+	if (std::getenv("KYTY_CAPS_LOG") != nullptr) {
+		std::printf("CAPS mesh=%d cond=%d fbloop=%d maint8=%d provoking=%d robust2=%d clock=%d "
+		            "img64=%d bary=%d minmax=%d lds64=%d wgl=%d sgctl=%d sg=%u-%u r8srgb=%d "
+		            "meshLayers=%u meshPrims=%u meshVerts=%u\n",
+		            graphics.mesh_shader_enabled, graphics.conditional_rendering_enabled,
+		            graphics.attachment_feedback_loop_enabled, graphics.maintenance8_enabled,
+		            graphics.provoking_vertex_last_enabled, graphics.robust_buffer_access_enabled,
+		            graphics.device_clock_period_ps != 0, graphics.shader_image_int64_atomics_enabled,
+		            barycentric_supported, graphics.sampler_filter_minmax_enabled,
+		            features12.shaderSharedInt64Atomics, workgroup_layout.workgroupMemoryExplicitLayout,
+		            graphics.compute_subgroup_size_control_enabled, graphics.min_subgroup_size,
+		            graphics.max_subgroup_size, graphics.r8_srgb_views,
+		            graphics.mesh_shader_properties.maxMeshOutputLayers,
+		            graphics.mesh_shader_properties.maxMeshOutputPrimitives,
+		            graphics.mesh_shader_properties.maxMeshOutputVertices);
+		for (const auto* ext: device_extensions) {
+			std::printf("CAPS ext %s\n", ext);
+		}
+	}
 	if (graphics.mesh_shader_enabled) {
 		LOGF("Vulkan MeshEXT: invocations=%u vertices=%u primitives=%u shared=%u\n",
 		     graphics.mesh_shader_properties.maxMeshWorkGroupInvocations,

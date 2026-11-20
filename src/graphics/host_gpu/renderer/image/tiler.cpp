@@ -15,6 +15,8 @@
 #include "gpu_tiler_shaders/gpu_tiler_standard64_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_color_transform_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_color_clear_spv.h"
+#include "gpu_tiler_shaders/gpu_tiler_color_apply_spv.h"
+#include "gpu_tiler_shaders/gpu_tiler_color_apply_3d_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -71,9 +73,11 @@ TileManager::~TileManager() {
 		m_graphics.device.destroyPipeline(pipeline, nullptr);
 	}
 	for (auto pipeline: {m_d16_to_d24, m_d16_to_d32, m_d24_to_d16, m_d32_to_d16, m_color_transform,
-	                     m_color_clear}) {
+	                     m_color_clear, m_color_apply, m_color_apply_3d}) {
 		m_graphics.device.destroyPipeline(pipeline, nullptr);
 	}
+	m_graphics.device.destroyPipelineLayout(m_apply_pipeline_layout, nullptr);
+	m_graphics.device.destroyDescriptorSetLayout(m_apply_descriptor_layout, nullptr);
 	m_graphics.device.destroyPipelineLayout(m_pipeline_layout, nullptr);
 	m_graphics.device.destroyDescriptorSetLayout(m_descriptor_layout, nullptr);
 }
@@ -669,6 +673,87 @@ vk::Buffer TileManager::CheckColorClear(Result metadata, uint64_t stride, uint32
 	                        vk::PipelineStageFlagBits::eAllCommands, {}, 1, &barrier, 0, nullptr,
 	                        0, nullptr);
 	return m_clear_predicates->Handle();
+}
+
+void TileManager::ApplyColorClear(vk::Buffer predicates, vk::ImageView storage_view, bool volume,
+                                  uint32_t width, uint32_t height, uint32_t slices,
+                                  uint32_t base_slice, uint32_t keys,
+                                  const std::array<vk::ClearColorValue, ColorClearSlots>& colors) {
+	struct Apply {
+		std::array<std::array<float, 4>, ColorClearSlots> colors;
+		std::array<uint32_t, 4>                            params;
+		std::array<uint32_t, 4>                            extra;
+	};
+	static_assert(sizeof(Apply) == 160);
+	EXIT_IF(sizeof(Apply) > m_graphics.GetPhysicalDeviceProperties().limits.maxPushConstantsSize);
+	if (m_apply_pipeline_layout == nullptr) {
+		const std::array<vk::DescriptorSetLayoutBinding, 2> bindings {{
+		    {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
+		    {1, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
+		}};
+		vk::DescriptorSetLayoutCreateInfo descriptor_info {};
+		descriptor_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+		descriptor_info.bindingCount = static_cast<uint32_t>(bindings.size());
+		descriptor_info.pBindings    = bindings.data();
+		RequireVulkanSuccess(m_graphics.device.createDescriptorSetLayout(
+		                         &descriptor_info, nullptr, &m_apply_descriptor_layout),
+		                     "create color-apply descriptor layout");
+		const vk::PushConstantRange  push_range {vk::ShaderStageFlagBits::eCompute, 0, sizeof(Apply)};
+		vk::PipelineLayoutCreateInfo layout_info {};
+		layout_info.setLayoutCount         = 1;
+		layout_info.pSetLayouts            = &m_apply_descriptor_layout;
+		layout_info.pushConstantRangeCount = 1;
+		layout_info.pPushConstantRanges    = &push_range;
+		RequireVulkanSuccess(m_graphics.device.createPipelineLayout(&layout_info, nullptr,
+		                                                            &m_apply_pipeline_layout),
+		                     "create color-apply pipeline layout");
+		for (auto [pipeline, code]: {std::pair {&m_color_apply, std::span<const uint32_t>(GPU_TILER_COLOR_APPLY_SPV)},
+		                             std::pair {&m_color_apply_3d, std::span<const uint32_t>(GPU_TILER_COLOR_APPLY_3D_SPV)}}) {
+			const auto module = CompileSPV(code, m_graphics.device);
+			vk::ComputePipelineCreateInfo create {};
+			create.stage.stage  = vk::ShaderStageFlagBits::eCompute;
+			create.stage.module = module;
+			create.stage.pName  = "main";
+			create.layout       = m_apply_pipeline_layout;
+			const auto result =
+			    m_graphics.device.createComputePipelines(nullptr, 1, &create, nullptr, pipeline);
+			m_graphics.device.destroyShaderModule(module, nullptr);
+			RequireVulkanSuccess(result, "create color-apply pipeline");
+		}
+	}
+	Apply push {};
+	for (uint32_t key = 0; key < ColorClearSlots; key++) {
+		for (uint32_t c = 0; c < 4; c++) {
+			push.colors[key][c] = colors[key].float32[c];
+		}
+	}
+	push.params = {keys, slices, width, height};
+	push.extra  = {base_slice, 0, 0, 0};
+	const vk::DescriptorBufferInfo predicate_info {predicates, 0, VK_WHOLE_SIZE};
+	const vk::DescriptorImageInfo  image_info {nullptr, storage_view, vk::ImageLayout::eGeneral};
+	std::array<vk::WriteDescriptorSet, 2> writes {};
+	writes[0].dstBinding      = 0;
+	writes[0].descriptorCount = 1;
+	writes[0].descriptorType  = vk::DescriptorType::eStorageBuffer;
+	writes[0].pBufferInfo     = &predicate_info;
+	writes[1].dstBinding      = 1;
+	writes[1].descriptorCount = 1;
+	writes[1].descriptorType  = vk::DescriptorType::eStorageImage;
+	writes[1].pImageInfo      = &image_info;
+	m_scheduler.EndRendering();
+	auto command = m_scheduler.Current().Handle();
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, volume ? m_color_apply_3d : m_color_apply);
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_apply_pipeline_layout, 0,
+	                             static_cast<uint32_t>(writes.size()), writes.data());
+	command.pushConstants(m_apply_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+	                      sizeof(push), &push);
+	command.dispatch((width + 7) / 8, (height + 7) / 8, slices);
+	vk::MemoryBarrier barrier {
+	    .srcAccessMask = vk::AccessFlagBits::eShaderWrite,
+	    .dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite};
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+	                        vk::PipelineStageFlagBits::eAllCommands, {}, 1, &barrier, 0, nullptr,
+	                        0, nullptr);
 }
 
 } // namespace Libs::Graphics

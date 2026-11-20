@@ -6,6 +6,7 @@
 #include "common/fpEnv.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -21,6 +22,7 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <memory>
@@ -507,9 +509,13 @@ static void SchedulerBackoffOnce() {
 #endif
 }
 
+static void YieldWithSpinBackoff();
+
 static void SleepMicroWithSignalPoll(uint64_t microseconds) {
 	if (microseconds == 0) {
 		KernelDispatchPendingSignalForCurrentThread();
+		// a real usleep(0) gives up the core; returning at once made it a busy spin.
+		YieldWithSpinBackoff();
 		return;
 	}
 
@@ -3629,8 +3635,35 @@ int KYTY_SYSV_ABI PthreadRename(Pthread thread, const char* name) {
 	return OK;
 }
 
+// guest job threads that only yield in a loop burn whole host cores and starve the
+// emulator's GPU thread. After a streak of back-to-back yields (each within 50 us of the last) the
+// thread sleeps 50 us instead. KYTY_YIELD_NO_SLEEP=1 restores plain yields.
+static void YieldWithSpinBackoff() {
+	constexpr int64_t  StreakGapNs  = 50'000;
+	constexpr uint32_t StreakToNap  = 64;
+	constexpr uint32_t NapMicros    = 50;
+	static const bool  disabled     = std::getenv("KYTY_YIELD_NO_SLEEP") != nullptr;
+	thread_local std::chrono::steady_clock::time_point last {};
+	thread_local uint32_t streak = 0;
+	if (disabled) {
+		SchedulerBackoffOnce();
+		return;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	const auto gap = std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count();
+	streak         = gap < StreakGapNs ? streak + 1 : 0;
+	if (streak >= StreakToNap) {
+		Common::Thread::SleepMicro(NapMicros);
+		Common::PerfStats::Bump(Common::PerfStats::g_yield_sleeps);
+		streak = StreakToNap - 16; // keep napping every 16 yields while the spin lasts
+	} else {
+		SchedulerBackoffOnce();
+	}
+	last = std::chrono::steady_clock::now();
+}
+
 void KYTY_SYSV_ABI PthreadYield() {
-	SchedulerBackoffOnce();
+	YieldWithSpinBackoff();
 }
 
 int KYTY_SYSV_ABI PthreadGetthreadid() {

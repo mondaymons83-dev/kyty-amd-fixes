@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 #include "graphics/presentation/renderDoc.h"
 
 #include "common/logging/log.h"
@@ -10,6 +12,7 @@
 #include <filesystem>
 #include <renderdoc_app.h>
 #include <string>
+#include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h>
@@ -50,7 +53,7 @@ static bool BindRenderDocApi(void* module) {
 	g_api = static_cast<RENDERDOC_API_1_6_0*>(api);
 	g_api->SetCaptureKeys(nullptr, 0);
 	g_api->UnloadCrashHandler();
-	LOGF("RenderDoc: API 1.6.0 bound\n");
+	std::printf("RenderDoc: API 1.6.0 bound\n");
 	return true;
 }
 
@@ -87,7 +90,7 @@ void RenderDocInit() {
 	}
 
 	if (!BindRenderDocApi(module)) {
-		LOGF("RenderDoc: API 1.6.0 is unavailable\n");
+		std::printf("RenderDoc: API 1.6.0 is unavailable\n");
 	}
 }
 
@@ -107,7 +110,7 @@ void RenderDocInit() {
 	}
 
 	if (!BindRenderDocApi(module)) {
-		LOGF("RenderDoc: API 1.6.0 is unavailable\n");
+		std::printf("RenderDoc: API 1.6.0 is unavailable\n");
 		::dlclose(module);
 	}
 }
@@ -117,21 +120,21 @@ void RenderDocInit() {
 void RenderDocRequestCapture() {
 	if (g_api == nullptr) {
 		if (!g_unavailable_log.exchange(true)) {
-			LOGF("RenderDoc: capture requested, but RenderDoc is unavailable\n");
+			std::printf("RenderDoc: capture requested, but RenderDoc is unavailable\n");
 		}
 		return;
 	}
 
 	RenderDocState expected = RenderDocState::Idle;
 	if (g_state.compare_exchange_strong(expected, RenderDocState::Requested)) {
-		LOGF("RenderDoc: capture requested\n");
+		std::printf("RenderDoc: capture requested\n");
 	}
 }
 
 static void StartCapture() {
 	if (g_api->IsFrameCapturing() != 0) {
 		g_state.store(RenderDocState::Idle, std::memory_order_release);
-		LOGF("RenderDoc: capture request ignored because a capture is already active\n");
+		std::printf("RenderDoc: capture request ignored because a capture is already active\n");
 		return;
 	}
 
@@ -143,22 +146,46 @@ static void StartCapture() {
 	g_api->StartFrameCapture(nullptr, nullptr);
 	if (g_api->IsFrameCapturing() == 0) {
 		g_state.store(RenderDocState::Idle, std::memory_order_release);
-		LOGF("RenderDoc: capture failed to start\n");
+		std::printf("RenderDoc: capture failed to start\n");
 		return;
 	}
 	g_captured_flips = 0;
 	g_state.store(RenderDocState::Capturing, std::memory_order_release);
-	LOGF("RenderDoc: capture started\n");
+	std::printf("RenderDoc: capture started\n");
+}
+
+// KYTY_RD_AFTER_SEC=N[,N2,...] requests captures at those seconds after the first flip (no keyboard needed).
+static void MaybeTimedCapture() {
+	static const char* const env   = std::getenv("KYTY_RD_AFTER_SEC");
+	static const auto        first = std::chrono::steady_clock::now();
+	static size_t            next  = 0;
+	static const auto        times = [] {
+		std::vector<long> list;
+		for (const char* p = env; p != nullptr && *p != '\0';) {
+			char* end = nullptr;
+			list.push_back(std::strtol(p, &end, 10));
+			p = (end != nullptr && *end == ',') ? end + 1 : nullptr;
+		}
+		return list;
+	}();
+	if (next >= times.size()) {
+		return;
+	}
+	if (std::chrono::steady_clock::now() - first >= std::chrono::seconds(times[next])) {
+		next++;
+		RenderDocRequestCapture();
+	}
 }
 
 void RenderDocOnGuestFlip(RenderContext& renderer) {
+	MaybeTimedCapture();
 	const auto state = g_state.load(std::memory_order_acquire);
 	if (state == RenderDocState::Idle) {
 		return;
 	}
 	if (state == RenderDocState::Capturing) {
 		++g_captured_flips;
-		LOGF("RenderDoc: captured guest flip %u/2\n", g_captured_flips);
+		std::printf("RenderDoc: captured guest flip %u/2\n", g_captured_flips);
 		if (g_captured_flips < 2) {
 			return;
 		}
@@ -172,7 +199,7 @@ void RenderDocOnGuestFlip(RenderContext& renderer) {
 	} else {
 		const auto ok = g_api->EndFrameCapture(nullptr, nullptr);
 		g_state.store(RenderDocState::Idle, std::memory_order_release);
-		LOGF(ok != 0 ? "RenderDoc: capture finished\n" : "RenderDoc: capture failed\n");
+		std::printf(ok != 0 ? "RenderDoc: capture finished\n" : "RenderDoc: capture failed\n");
 	}
 }
 

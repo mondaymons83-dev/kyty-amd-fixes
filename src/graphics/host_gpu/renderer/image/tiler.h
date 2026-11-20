@@ -61,6 +61,13 @@ public:
 	// bit `keys` selects; a hit expands to 0xff when `expand` is set.
 	[[nodiscard]] vk::Buffer CheckColorClear(Result metadata, uint64_t stride, uint32_t slices,
 	                                         uint32_t keys, bool expand);
+	// Writes each slice's hit key color (from CheckColorClear's predicates) into a storage view
+	// in one dispatch, instead of one predicated clear per slice and key. The view is 2D-array
+	// (slices = layers) or 3D (slices = depth). Records on the current command buffer.
+	void ApplyColorClear(vk::Buffer predicates, vk::ImageView storage_view, bool volume,
+	                     uint32_t width, uint32_t height, uint32_t slices, uint32_t base_slice,
+	                     uint32_t keys,
+	                     const std::array<vk::ClearColorValue, ColorClearSlots>& colors);
 
 private:
 	friend struct TileManagerTestAccess;
@@ -140,6 +147,10 @@ private:
 	vk::Pipeline                            m_d32_to_d16      = nullptr;
 	vk::Pipeline                            m_color_transform = nullptr;
 	vk::Pipeline                            m_color_clear     = nullptr;
+	vk::Pipeline m_color_apply = nullptr;
+	vk::Pipeline m_color_apply_3d = nullptr;
+	vk::DescriptorSetLayout m_apply_descriptor_layout = nullptr;
+	vk::PipelineLayout m_apply_pipeline_layout = nullptr;
 	std::unique_ptr<Buffer>                 m_clear_predicates;
 };
 

@@ -24,6 +24,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -34,6 +35,7 @@
 namespace Libs::Graphics {
 
 static thread_local Pm4Execution* g_current_execution = nullptr;
+
 static thread_local GuestGpu*     g_gpu_state         = nullptr;
 
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
@@ -391,6 +393,11 @@ void GuestGpu::ThreadRun(void* data) {
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	g_gpu_state = gpu;
+	// this thread turns every guest draw into Vulkan work; on a 6-core CPU it
+	// competes with the guest's spinning job threads. KYTY_GPU_NORMAL_PRIORITY=1 turns it off.
+	if (std::getenv("KYTY_GPU_NORMAL_PRIORITY") == nullptr) {
+		Common::Thread::RaiseCurrentThreadPriority();
+	}
 
 	for (;;) {
 		Submission                   submission;
@@ -702,6 +709,18 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		case 0x00: m_predicate_skip = (value != 0); break;
 		case 0x01: m_predicate_skip = (value == 0); break;
 		default: EXIT("unknown predication condition: 0x%08" PRIx32 "\n", condition);
+	}
+	// KYTY_PRED_LOG=1: one line per predication decision (diagnostic).
+	static const bool pred_log = std::getenv("KYTY_PRED_LOG") != nullptr;
+	if (pred_log) {
+		const auto vaddr   = reinterpret_cast<uint64_t>(address);
+		auto&      buffers = m_renderer.GetBufferCache();
+		const bool gpu_mod = vaddr != 0 && buffers.IsRegionGpuModified(vaddr, 8);
+		const bool gpu_dirty = vaddr != 0 && buffers.HasGpuDirtyBytes(vaddr, 8);
+		std::printf("PRED op=%u cond=%u wait=%u addr=%p value=%llu skip=%d gpumod=%d dirty=%d\n", op,
+		            condition, wait_op, const_cast<void*>(address),
+		            static_cast<unsigned long long>(value), m_predicate_skip ? 1 : 0, gpu_mod ? 1 : 0,
+		            gpu_dirty ? 1 : 0);
 	}
 }
 
@@ -1051,6 +1070,11 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 		LOGF("CommandProcessor::Flip()\n");
 	}
 	m_renderer.GetOcclusionQueries().Publish();
+	{
+		static uint64_t flip_count = 0;
+		m_renderer.GetTextureCache().DumpImagesIfRequested(++flip_count);
+		m_renderer.GetBufferCache().PrefetchHotReadbacks(flip_count);
+	}
 
 	auto& command = CurrentBuffer();
 	auto  request = Sync::PrepareVideoOutFlip(command, handle, index, flip_mode, flip_arg);

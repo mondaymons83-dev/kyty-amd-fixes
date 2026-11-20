@@ -8,6 +8,9 @@
 #include <unordered_set>
 #include <vector>
 
+#include <cstdlib>
+#include <cstring>
+
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
@@ -196,11 +199,44 @@ std::optional<ValueOpcode> WaveReduction(ValueOpcode operation) {
 	}
 }
 
+// Diagnostic opt-out (A1): skips the whole ReadLane/reduction pass for shaders whose 64-bit hash
+// is listed (hex, separated by comma/space/;) in
+// KYTY_DISABLE_READLANE_ELIMINATION_HASHES, letting the original DPP scan run. Controlled by the
+// environment variable; no effect when it is not set.
+bool ReadLaneEliminationDisabledForHash(uint64_t shader_hash) {
+	const char* env = std::getenv("KYTY_DISABLE_READLANE_ELIMINATION_HASHES");
+	if (env == nullptr || *env == '\0') {
+		return false;
+	}
+	for (const char* cursor = env; *cursor != '\0';) {
+		while (*cursor == ',' || *cursor == ';' || *cursor == ' ' || *cursor == '\t') {
+			cursor++;
+		}
+		if (*cursor == '\0') {
+			break;
+		}
+		char*          end   = nullptr;
+		const uint64_t value = std::strtoull(cursor, &end, 16);
+		if (end == cursor) {
+			cursor++;
+			continue;
+		}
+		if (value == shader_hash) {
+			return true;
+		}
+		cursor = end;
+	}
+	return false;
+}
+
 } // namespace
 
 ReadLaneStats EliminateReadLane(Program& program, uint32_t wave_size) {
 	ReadLaneStats stats;
 	if (wave_size != 32u && wave_size != 64u) {
+		return stats;
+	}
+	if (ReadLaneEliminationDisabledForHash(program.shader_hash)) {
 		return stats;
 	}
 

@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
+#include <algorithm>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -46,7 +47,38 @@ void DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
 		const bool cull = output.kind == IR::StageOutputKind::CullDistance;
 		auto& variable = clip ? state.clip_distance_variable
 		                 : cull ? state.cull_distance_variable : output.variable_id;
-		if (variable == 0) {
+		if (variable == 0 && output.kind == IR::StageOutputKind::Layer) {
+			// Per-primitive Layer lives in a Block struct, the way glslang emits it. AMD's
+			// Windows driver (amdvlk64) dereferences null while creating a mesh pipeline whose
+			// Layer is a loose builtin array; the Block form works on every driver.
+			// With layer chunks the chunk's ViewportIndex is member 1 of the same Block, like
+			// glslang's gl_MeshPerPrimitiveEXT (amdvlk also reports maxMeshOutputLayers = 8).
+			const bool with_chunk = MeshLayerChunk(state) != 0;
+			const auto block =
+			    with_chunk
+			        ? state.builder.DecoratedType(
+			              spv::OpTypeStruct,
+			              {{spv::OpMemberDecorate, {0, spv::DecorationBuiltIn, spv::BuiltInLayer}},
+			               {spv::OpMemberDecorate, {0, spv::DecorationPerPrimitiveEXT}},
+			               {spv::OpMemberDecorate,
+			                {1, spv::DecorationBuiltIn, spv::BuiltInViewportIndex}},
+			               {spv::OpMemberDecorate, {1, spv::DecorationPerPrimitiveEXT}},
+			               {spv::OpDecorate, {spv::DecorationBlock}}},
+			              type, type)
+			        : state.builder.DecoratedType(
+			              spv::OpTypeStruct,
+			              {{spv::OpMemberDecorate, {0, spv::DecorationBuiltIn, spv::BuiltInLayer}},
+			               {spv::OpMemberDecorate, {0, spv::DecorationPerPrimitiveEXT}},
+			               {spv::OpDecorate, {spv::DecorationBlock}}},
+			              type);
+			variable = MeshArray(state, spv::StorageClassOutput, block, mesh.max_primitives);
+			state.interface_variables.push_back(variable);
+			state.builder.AddName(variable, output.debug_name.c_str());
+			if (with_chunk) {
+				state.mesh_chunk_viewport          = variable;
+				state.mesh_chunk_viewport_in_block = true;
+			}
+		} else if (variable == 0) {
 			const auto element_type = clip || cull
 			                              ? state.builder.Type(spv::OpTypeArray, type,
 			                                                   ConstantU32(state, clip ? clip_distance_count
@@ -61,14 +93,10 @@ void DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
 				state.builder.AddAnnotation(spv::OpDecorate, variable,
 				                            spv::DecorationLocation, output.location);
 			} else {
-				const auto builtin = clip ? spv::BuiltInClipDistance
+				const auto builtin = clip   ? spv::BuiltInClipDistance
 				                     : cull ? spv::BuiltInCullDistance
-				                     : output.kind == IR::StageOutputKind::Layer ? spv::BuiltInLayer
-				                                                                 : spv::BuiltInPosition;
+				                            : spv::BuiltInPosition;
 				state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBuiltIn, builtin);
-			}
-			if (output.kind == IR::StageOutputKind::Layer) {
-				state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationPerPrimitiveEXT);
 			}
 		}
 		output.variable_id = variable;
@@ -77,6 +105,16 @@ void DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
 		output.mesh_data_variable =
 		    MeshArray(state, shared ? spv::StorageClassWorkgroup : spv::StorageClassPrivate, type,
 		              shared ? mesh.max_vertices : state.lane_count);
+	}
+	if (MeshLayerChunk(state) != 0 && state.mesh_chunk_viewport == 0) {
+		state.mesh_chunk_viewport =
+		    MeshArray(state, spv::StorageClassOutput, TypeU32(state), mesh.max_primitives);
+		state.interface_variables.push_back(state.mesh_chunk_viewport);
+		state.builder.AddName(state.mesh_chunk_viewport, "gl_ViewportIndex");
+		state.builder.AddAnnotation(spv::OpDecorate, state.mesh_chunk_viewport,
+		                            spv::DecorationBuiltIn, spv::BuiltInViewportIndex);
+		state.builder.AddAnnotation(spv::OpDecorate, state.mesh_chunk_viewport,
+		                            spv::DecorationPerPrimitiveEXT);
 	}
 	state.mesh_allocation = MeshArray(state, spv::StorageClassWorkgroup, TypeU32(state), 2);
 	state.mesh_primitive_data =
@@ -135,18 +173,59 @@ void EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst) {
 	});
 }
 
+uint32_t MeshLayerChunk(const EmitterState& state) {
+	if (state.program.stage != ShaderType::Mesh || state.profile.mesh_output_layers == 0) {
+		return 0;
+	}
+	const auto writes = [&](IR::StageOutputKind kind) {
+		return std::ranges::any_of(state.program.info.outputs,
+		                           [kind](const IR::StageOutput& output) { return output.kind == kind; });
+	};
+	// The chunk travels in ViewportIndex, so a shader that writes its own keeps the old path.
+	return writes(IR::StageOutputKind::Layer) && !writes(IR::StageOutputKind::ViewportIndex)
+	           ? state.profile.mesh_output_layers
+	           : 0u;
+}
+
 void EmitMeshEntryPoint(EmitterState& state) {
 	state.builder.AddFunction(spv::OpFunction, TypeVoid(state), state.main_func,
 	                          spv::FunctionControlMaskNone, TypeFunction(state));
 	EmitLabel(state, state.builder.AllocateId());
-	state.builder.AddFunction(spv::OpFunctionCall, TypeVoid(state), state.builder.AllocateId(),
-	                          state.mesh_guest_func);
+	// A host with few mesh layers draws layers [chunk * L, chunk * L + L) with NumWorkgroups.z =
+	// chunk + 1; only the last Z group runs the guest, and Layer is relative to the chunk.
+	const auto layer_chunk = MeshLayerChunk(state);
+	uint32_t   chunk_active = ConstantBool(state, true);
+	uint32_t   layer_base   = ConstantU32(state, 0);
+	uint32_t   chunk        = ConstantU32(state, 0);
+	if (layer_chunk != 0) {
+		const auto group_z = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 2);
+		const auto count_z = EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 2);
+		chunk              = EmitBinaryU32(state, spv::OpISub, count_z, ConstantU32(state, 1));
+		chunk_active       = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpIEqual, TypeBool(state), chunk_active, group_z, chunk);
+		layer_base = EmitBinaryU32(state, spv::OpIMul, chunk, ConstantU32(state, layer_chunk));
+	}
+	EmitIfCondition(state, chunk_active, [&] {
+		state.builder.AddFunction(spv::OpFunctionCall, TypeVoid(state),
+		                          state.builder.AllocateId(), state.mesh_guest_func);
+	});
 	// All guest waves finish before the uniform Vulkan allocation and output stores.
 	EmitBarrier(state);
-	const auto vertices   = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,
-	                                 TypeU32(state), ConstantU32(state, 0));
-	const auto primitives = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,
-	                                 TypeU32(state), ConstantU32(state, 1));
+	const auto select_active = [&](uint32_t value) {
+		if (layer_chunk == 0) {
+			return value;
+		}
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), result, chunk_active, value,
+		                          ConstantU32(state, 0));
+		return result;
+	};
+	const auto vertices   = select_active(MeshLoad(state, state.mesh_allocation,
+	                                               spv::StorageClassWorkgroup, TypeU32(state),
+	                                               ConstantU32(state, 0)));
+	const auto primitives = select_active(MeshLoad(state, state.mesh_allocation,
+	                                               spv::StorageClassWorkgroup, TypeU32(state),
+	                                               ConstantU32(state, 1)));
 	state.builder.AddFunction(spv::OpSetMeshOutputsEXT, vertices,
 	                          primitives); // OpSetMeshOutputsEXT
 	for (uint32_t half = 0; half < state.lane_count; half++) {
@@ -209,11 +288,41 @@ void EmitMeshEntryPoint(EmitterState& state) {
 				if (output.kind != IR::StageOutputKind::Layer) {
 					continue;
 				}
-				const auto layer = MeshLoad(state, output.mesh_data_variable,
-				                            spv::StorageClassWorkgroup, TypeU32(state),
-				                            vertex[state.input_info.vertex->mesh.provoking_vertex]);
-				const auto pointer = MeshElement(state, output.variable_id, spv::StorageClassOutput,
-				                                 TypeU32(state), index);
+				auto layer = MeshLoad(state, output.mesh_data_variable, spv::StorageClassWorkgroup,
+				                      TypeU32(state),
+				                      vertex[state.input_info.vertex->mesh.provoking_vertex]);
+				if (layer_chunk != 0) {
+					// Layers below the chunk wrap to large values; both sides are culled.
+					layer = EmitBinaryU32(state, spv::OpISub, layer, layer_base);
+					const auto outside = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), outside,
+					                          layer, ConstantU32(state, layer_chunk));
+					const auto cull = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), cull, culled,
+					                          outside);
+					state.builder.AddFunction(spv::OpStore,
+					                          MeshElement(state, state.mesh_cull,
+					                                      spv::StorageClassOutput, TypeBool(state),
+					                                      index),
+					                          cull);
+					uint32_t viewport_pointer = 0;
+					if (state.mesh_chunk_viewport_in_block) {
+						viewport_pointer = state.builder.AllocateId();
+						state.builder.AddFunction(
+						    spv::OpAccessChain,
+						    TypePointer(state, spv::StorageClassOutput, TypeU32(state)),
+						    viewport_pointer, state.mesh_chunk_viewport, index, ConstantU32(state, 1));
+					} else {
+						viewport_pointer = MeshElement(state, state.mesh_chunk_viewport,
+						                               spv::StorageClassOutput, TypeU32(state), index);
+					}
+					state.builder.AddFunction(spv::OpStore, viewport_pointer, chunk);
+				}
+				// The Layer output is an array of single-member Block structs (amdvlk workaround).
+				const auto pointer = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpAccessChain,
+				                          TypePointer(state, spv::StorageClassOutput, TypeU32(state)),
+				                          pointer, output.variable_id, index, ConstantU32(state, 0));
 				state.builder.AddFunction(spv::OpStore, pointer, layer);
 			}
 		});

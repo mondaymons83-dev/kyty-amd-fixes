@@ -205,6 +205,7 @@ public:
 	const ShaderModule* GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                      ShaderComputeInputInfo&      input_info);
 
+	// With async pipelines the returned pipeline can still be null: skip the draw.
 	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state,
 	                              const DrawTargets& targets);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
@@ -262,6 +263,13 @@ private:
 	std::unordered_map<uint64_t, ShaderTessellationInputInfo>                  m_tess_layouts;
 	// Records everything first created if a shader store is open, and writes the driver cache.
 	ShaderStoreWriter m_store;
+	// Graphics pipelines compiled on worker threads (on unless KYTY_SYNC_PIPELINES is set): a draw
+	// whose pipeline is not ready yet is skipped instead of stalling the frame. Declared last so its
+	// workers stop before anything they use goes away.
+	struct AsyncPipelines;
+	std::unique_ptr<AsyncPipelines> m_async;
+	// Moves pipelines the workers finished into m_graphics_pipelines.
+	void CollectAsyncPipelines();
 
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,

@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bitset>
 #include <map>
 #include <mutex>
@@ -22,6 +23,18 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+// Diagnostic image trace (KYTY_TRACE); the compute dispatch being bound, for trace lines.
+namespace ImageTrace {
+extern std::atomic<uint64_t> g_flip;
+extern std::atomic<uint64_t> g_cs_hash;
+extern std::atomic<uint64_t> g_cs_groups; // x | y << 21 | z << 42, top bit set for indirect
+[[nodiscard]] bool           Enabled();
+[[nodiscard]] bool           MatchesExtent(uint32_t width, uint32_t height);
+// Set when an image dump fires: the next dispatches of the KYTY_DUMP_CS shaders save their buffers.
+extern std::atomic<uint32_t> g_buffer_dump_budget;
+[[nodiscard]] const char*    DumpDir();
+} // namespace ImageTrace
 
 struct GraphicContext;
 class Buffer;
@@ -84,6 +97,10 @@ public:
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
+	// Diagnostic image dump; a no-op unless KYTY_DUMP_DIR is set and its trigger file exists.
+	void DumpImagesIfRequested(uint64_t flip);
+	// Diagnostic; a no-op unless KYTY_PERF_STATS is set.
+	void PrintPerfStats(uint64_t flip);
 	// With storage readback, a GL2 writeback makes GPU-written images visible to the CPU; returns
 	// whether a download was recorded.
 	[[nodiscard]] bool WriteBackImages();

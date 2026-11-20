@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cstdlib>
 #include <optional>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -25,8 +27,9 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 	if (kind == IR::StageInputKind::LocalInvocationIndex) {
 		return EmitLocalInvocationIndex(state);
 	}
-	if (state.lane_count == 2 && (kind == IR::StageInputKind::LocalInvocationId ||
-	                              kind == IR::StageInputKind::GlobalInvocationId)) {
+	if ((state.lane_count == 2 || state.lane_remap) &&
+	    (kind == IR::StageInputKind::LocalInvocationId ||
+	     kind == IR::StageInputKind::GlobalInvocationId)) {
 		const auto* cs      = ShaderWorkgroupInput(state.program.stage, state.input_info);
 		uint32_t    divisor = 1;
 		for (uint32_t axis = 0; axis < component; axis++) {
@@ -69,6 +72,16 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 		const auto bits  = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpLoad, TypeI32(state), value, variable);
 		state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
+		if (kind == IR::StageInputKind::Layer && state.chunk_viewport_input != 0) {
+			// A chunked mesh draw rasterizes Layer relative to its chunk (MeshLayerChunk).
+			const auto chunk      = state.builder.AllocateId();
+			const auto chunk_bits = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLoad, TypeI32(state), chunk, state.chunk_viewport_input);
+			state.builder.AddFunction(spv::OpBitcast, TypeU32(state), chunk_bits, chunk);
+			return EmitAddU32(state, bits,
+			                  EmitBinaryU32(state, spv::OpIMul, chunk_bits,
+			                                ConstantU32(state, state.profile.mesh_output_layers)));
+		}
 		return bits;
 	}
 	if (kind == IR::StageInputKind::FragCoord || kind == IR::StageInputKind::TessCoord) {
@@ -568,6 +581,35 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto vector_type = MrtOutputMode(state, exp) != 0u ? MrtOutputType(state, exp.index)
 		                                                         : TypeF32Vector(state, 4);
 		auto       value       = ExportVector(ctx, data, exp, vector_type);
+		// PPSA15210: a bloom pixel shader exports NaN on AMD (Windows and RADV); additive blending
+		// keeps it and the bloom chain spreads it over the screen (the rainbow). Float color
+		// exports write NaN as 0 and clamp infinities to the half-float range.
+		// KYTY_KEEP_NAN_EXPORTS=1 restores the raw export.
+		static const bool keep_nan = std::getenv("KYTY_KEEP_NAN_EXPORTS") != nullptr;
+		if (!keep_nan && state.program.stage == ShaderType::Pixel &&
+		    exp.kind == IR::ExportTargetKind::Mrt && vector_type == TypeF32Vector(state, 4)) {
+			uint32_t   lanes[4] {};
+			const auto zero    = ConstantF32(state, 0);
+			const auto highest = ConstantF32(state, 0x477fe000u); // 65504.0f
+			const auto lowest  = ConstantF32(state, 0xc77fe000u); // -65504.0f
+			for (uint32_t component = 0; component < 4u; component++) {
+				const auto lane = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), lane, value,
+				                          component);
+				const auto is_nan = Unary(state, spv::OpIsNan, TypeBool(state), lane);
+				const auto clean  = Select(state, TypeF32(state), is_nan, zero, lane);
+				const auto low    = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpExtInst, TypeF32(state), low, GlslStd450(state),
+				                          GLSLstd450FMax, clean, lowest);
+				lanes[component] = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpExtInst, TypeF32(state), lanes[component],
+				                          GlslStd450(state), GLSLstd450FMin, low, highest);
+			}
+			const auto sanitized = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeConstruct, vector_type, sanitized, lanes[0],
+			                          lanes[1], lanes[2], lanes[3]);
+			value = sanitized;
+		}
 		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
 		    exp.index == 0 && vector_type == TypeF32Vector(state, 4) &&
 		    state.input_info.pixel->alpha_blend_source != ShaderAlphaBlendSource::None) {
@@ -816,6 +858,40 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                  kind == CFG::BranchCondition::VccZero || kind == CFG::BranchCondition::SccZero;
 	// Zero-kind predicates are already inverted by translation.
 	auto predicate = ctx.Arg(inst, 0);
+	// PPSA15210: AMD's proprietary compiler lost per-lane values (LDS atomic offsets) merged after
+	// an EXEC-skip branch on subgroupAny, so Unreal's tile classifier wrote two thirds of its list
+	// to wrong slots (ghosts, checkerboard). Lanes outside EXEC do nothing in the branch body, so
+	// an EXEC branch can split per lane; isolated repro: 18360/18360 tiles instead of ~6200.
+	// KYTY_WAVE_EXEC_BRANCHES=1 restores the subgroup vote.
+	static const bool wave_exec_branches = std::getenv("KYTY_WAVE_EXEC_BRANCHES") != nullptr;
+	// Only the forward skip (s_cbranch_execz); EXECNZ also closes loops whose scalar state must
+	// stay wave-uniform.
+	// Unreal's 4 sun-light tile passes load scalar registers (descriptors,
+	// constants) inside an EXECZ region and use them after forcing EXEC to all lanes. Split per
+	// lane, the lanes that skipped keep stale scalar copies -> dotted, half-lit tiles. Those
+	// shaders keep the wave vote; the tile classifier keeps the per-lane split.
+	// KYTY_EXEC_SKIP_VOTE_HASHES=hex,hex overrides the list ("none" empties it).
+	static const std::vector<uint64_t> vote_hashes = [] {
+		std::vector<uint64_t> hashes {0xe515edb0e5af0a05ull, 0x49e67c11cf22c590ull,
+		                              0x4d08b2b95600ed92ull, 0xf0d49e5bc38c2d6dull};
+		if (const char* list = std::getenv("KYTY_EXEC_SKIP_VOTE_HASHES"); list != nullptr) {
+			hashes.clear();
+			for (const char* cursor = list; *cursor != '\0';) {
+				char*      end   = nullptr;
+				const auto value = std::strtoull(cursor, &end, 16);
+				if (end == cursor) break;
+				hashes.push_back(value);
+				cursor = (*end == ',') ? end + 1 : end;
+			}
+		}
+		return hashes;
+	}();
+	const bool keep_vote = std::ranges::find(vote_hashes, ctx.state.program.shader_hash) !=
+	                       vote_hashes.end();
+	if (!wave_exec_branches && !keep_vote && ctx.other_half == nullptr &&
+	    kind == CFG::BranchCondition::ExecSkip) {
+		return predicate;
+	}
 	if (ctx.other_half != nullptr) {
 		predicate = Binary(ctx.state, zero ? spv::OpLogicalAnd : spv::OpLogicalOr,
 		                   TypeBool(ctx.state), predicate, ctx.HalfArg(inst, 0, 1));

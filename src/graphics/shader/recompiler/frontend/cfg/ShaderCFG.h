@@ -20,7 +20,9 @@ enum class BranchCondition {
 	ExecNonZero,
 	ScalarInstruction,
 	Expression,
-	Unknown
+	Unknown,
+	// ConditionRef only: the nonzero EXEC vote of an s_cbranch_execz, kept apart from loop EXECNZ.
+	ExecSkip
 };
 
 struct ConditionExpression {

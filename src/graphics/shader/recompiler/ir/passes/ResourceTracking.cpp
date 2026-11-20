@@ -1293,6 +1293,7 @@ private:
 				const bool zero = kind == CFG::BranchCondition::ExecZero ||
 				                  kind == CFG::BranchCondition::VccZero;
 				const bool nonzero = kind == CFG::BranchCondition::ExecNonZero ||
+				                     kind == CFG::BranchCondition::ExecSkip ||
 				                     kind == CFG::BranchCondition::VccNonZero;
 				if (!scalar && !zero && !nonzero) break;
 				// SCC is uniform. Negating a lane reduction exchanges all and any.

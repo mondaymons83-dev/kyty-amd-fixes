@@ -480,6 +480,28 @@ void DefineInputs(EmitterState& state) {
 		add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
 		add_builtin(IR::StageInputKind::NumWorkgroups, 3, "gl_NumWorkGroups");
 	}
+	if (MeshLayerChunk(state) != 0) {
+		add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
+		add_builtin(IR::StageInputKind::NumWorkgroups, 3, "gl_NumWorkGroups");
+	}
+	// PPSA15210: AMD's Windows driver may pack a 16x16 workgroup into waves in an order other than
+	// the linear local index, so guest shuffles and ballots mixed up pixels (checkerboard tiles).
+	// Tested 14-nov: applied, but the checkerboard did not change, so it stays off by default;
+	// KYTY_LANE_REMAP=1 turns it on.
+	if (state.program.stage == ShaderType::Compute && state.lane_count == 1 &&
+	    state.program.info.subgroup_local_invocation_id &&
+	    std::getenv("KYTY_LANE_REMAP") != nullptr) {
+		const auto* cs = ShaderWorkgroupInput(state.program.stage, state.input_info);
+		const auto threads = std::max(cs->threads_num[0], 1u) * std::max(cs->threads_num[1], 1u) *
+		                     std::max(cs->threads_num[2], 1u);
+		state.lane_remap = threads > cs->host_subgroup_size;
+		if (state.lane_remap &&
+		    std::ranges::any_of(state.inputs, [](const InputBinding& input) {
+			    return input.kind == IR::StageInputKind::GlobalInvocationId;
+		    })) {
+			add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
+		}
+	}
 	if (state.lane_count == 2) {
 		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
 		if (std::ranges::any_of(state.inputs, [](const InputBinding& input) {
@@ -579,6 +601,24 @@ void DefineInputs(EmitterState& state) {
 		if (state.program.stage == ShaderType::Pixel) {
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationFlat);
 		}
+	}
+	if (state.lane_remap && state.subgroup_local_invocation_id_variable != 0) {
+		const auto variable = DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassInput,
+		                                              "gl_SubgroupID");
+		state.subgroup_id_variable = variable;
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBuiltIn,
+		                            spv::BuiltInSubgroupId);
+	} else {
+		state.lane_remap = false;
+	}
+	if (state.program.stage == ShaderType::Pixel && state.profile.mesh_output_layers != 0 &&
+	    InputVariableForKind(state, IR::StageInputKind::Layer) != 0) {
+		const auto variable = DefineInterfaceVariable(state, TypeI32(state), spv::StorageClassInput,
+		                                              "gl_ViewportIndex");
+		state.chunk_viewport_input = variable;
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBuiltIn,
+		                            spv::BuiltInViewportIndex);
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationFlat);
 	}
 	if (state.program.info.helper_invocation) {
 		const auto variable = DefineInterfaceVariable(state, TypeBool(state), spv::StorageClassInput,
@@ -793,6 +833,9 @@ void DefineModule(EmitterState& state) {
 	if (state.viewport_index_variable != 0) {
 		state.builder.RequireVersion(0x00010500u);
 		state.builder.RequireCapability(spv::CapabilityShaderViewportIndex);
+	}
+	if (state.mesh_chunk_viewport != 0 || state.chunk_viewport_input != 0) {
+		state.builder.RequireCapability(spv::CapabilityMultiViewport);
 	}
 	if (InputVariableForKind(state, IR::StageInputKind::SampleId) != 0) {
 		state.builder.RequireCapability(spv::CapabilitySampleRateShading);

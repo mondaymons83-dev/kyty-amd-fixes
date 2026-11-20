@@ -1,0 +1,22 @@
+#version 450
+// Applies GPU-checked fast-clear keys to a 2D-array image in one dispatch; see
+// TileManager::ApplyColorClear. Each slice has at most one hit key.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer Predicates { uint data[]; } predicates;
+layout(set = 0, binding = 1) writeonly uniform image2DArray target;
+layout(push_constant, std430) uniform Apply {
+	vec4  colors[8];
+	uvec4 params; // keys, slices, width, height
+	uvec4 extra;  // x: first slice written (3D views start at depth 0)
+} apply;
+void main() {
+	const uvec3 id = gl_GlobalInvocationID;
+	if (id.x >= apply.params.z || id.y >= apply.params.w || id.z >= apply.params.y) return;
+	// Highest key first: the predicated-clear path clears keys in order, so the last hit wins.
+	for (int key = 7; key >= 0; key--) {
+		if ((apply.params.x & (1u << uint(key))) != 0u && predicates.data[id.z * 8u + uint(key)] != 0u) {
+			imageStore(target, ivec3(id.x, id.y, id.z + apply.extra.x), apply.colors[key]);
+			return;
+		}
+	}
+}

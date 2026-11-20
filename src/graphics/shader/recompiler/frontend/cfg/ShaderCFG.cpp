@@ -1744,6 +1744,7 @@ std::string BranchConditionToString(BranchCondition condition) {
 		case BranchCondition::VccNonZero: return "vccnz";
 		case BranchCondition::ExecZero: return "execz";
 		case BranchCondition::ExecNonZero: return "execnz";
+		case BranchCondition::ExecSkip: return "execskip";
 		case BranchCondition::ScalarInstruction: return "scalar_instruction";
 		case BranchCondition::Expression: return "expression";
 		default: return "unknown";

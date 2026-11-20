@@ -4,6 +4,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -59,6 +60,22 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 		EXIT("compute runtime buffer count does not match shader metadata\n");
 	}
 	auto& cache = buffer.GetContext().GetTextureCache();
+	// PPSA15210 (UE transient pool): a tile classifier that reads the scene and counts tiles with
+	// atomics wrote into memory a dead surface had registered as DCC metadata, so it was taken
+	// for a metadata clear and never ran; its tile passes then got zero tiles (the rainbow). A
+	// real metadata clear reads no image and uses no atomics. KYTY_LOOSE_META_CLEAR=1 restores the
+	// old rule.
+	static const bool loose_meta_clear = std::getenv("KYTY_LOOSE_META_CLEAR") != nullptr;
+	if (!loose_meta_clear) {
+		if (!program.info.images.empty()) {
+			return false;
+		}
+		for (const auto& resource: program.info.buffers) {
+			if (resource.atomic) {
+				return false;
+			}
+		}
+	}
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		const auto& resource   = program.info.buffers[i];
 		const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
@@ -192,6 +209,15 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	}
 	const bool image_clear =
 	    cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear);
+	// PPSA15210: a buffer fill consumed here writes guest memory from the CPU at record time, out
+	// of order with GPU work already recorded; the tile list Unreal clears every frame then mixed
+	// cleared slots with entries of older frames (ghosts and checkerboard tiles). The native
+	// dispatch runs in order instead. Tested 14-nov: the tile list kept its duplicates, so the
+	// shortcut stays on by default; KYTY_NATIVE_BUFFER_FILLS=1 runs the native dispatch.
+	static const bool consume_buffer_fills = std::getenv("KYTY_NATIVE_BUFFER_FILLS") == nullptr;
+	if (!image_clear && !consume_buffer_fills) {
+		return false;
+	}
 	if (!image_clear) {
 		// CPU fills invalidate overlapping cached images. Preserve the native dispatch for
 		// partial or ambiguous image backings, including pooled metadata aliases.
@@ -235,16 +261,25 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 		return;
 	}
 	auto& cache = context.GetBufferCache();
-	if (indirect_args != 0) {
-		cache.ReadMemory(indirect_args, sizeof(vk::DispatchIndirectCommand));
-		std::memcpy(input.workgroup_counts, reinterpret_cast<const void*>(indirect_args),
-		            sizeof(input.workgroup_counts));
-	}
 	// LDS has no contents to preserve between dispatches. The existing shader hazard
 	// barriers also order other users of this GPU-only utility buffer.
 	auto& storage = cache.GetUtilityBuffer(MemoryUsage::DeviceLocal);
 	const auto limit = std::min<uint64_t>(storage.Size(),
 	    context.GetGraphics().GetPhysicalDeviceProperties().limits.maxStorageBufferRange);
+	if (indirect_args != 0) {
+		// arguments the GPU just wrote (Unreal's tile classifier) would need a full
+		// GPU wait to read on the CPU. Each workgroup indexes its own LDS slice, so binding the
+		// whole range is enough and avoids the stall. KYTY_LDS_ARGS_READBACK=1 restores the read.
+		static const bool readback = std::getenv("KYTY_LDS_ARGS_READBACK") != nullptr;
+		if (!readback && cache.IsRegionGpuModified(indirect_args, sizeof(vk::DispatchIndirectCommand))) {
+			Common::PerfStats::Bump(Common::PerfStats::g_lds_stalls_avoided);
+			bindings.shared_memory = {storage.Handle(), 0, limit};
+			return;
+		}
+		cache.ReadMemory(indirect_args, sizeof(vk::DispatchIndirectCommand));
+		std::memcpy(input.workgroup_counts, reinterpret_cast<const void*>(indirect_args),
+		            sizeof(input.workgroup_counts));
+	}
 	uint64_t size = sizeof(uint32_t);
 	if (std::ranges::find(input.workgroup_counts, 0u) == std::end(input.workgroup_counts)) {
 		size = uint64_t {input.lds_size_dwords} * sizeof(uint32_t);
@@ -267,9 +302,74 @@ static bool HasStorageWrites(const ShaderComputeInputInfo& input_info,
 	       });
 }
 
+// Diagnostic: after an image dump (KYTY_DUMP_DIR), the next dispatches of the shaders listed in
+// KYTY_DUMP_CS (hex hashes, comma separated) save every buffer they bind, as the GPU left it.
+static void DumpShaderBuffers(RenderContext& context, const ShaderComputeInputInfo& input,
+                              vk::CommandBuffer command) {
+	static const char* list = std::getenv("KYTY_DUMP_CS");
+	const char*        dir  = ImageTrace::DumpDir();
+	if (list == nullptr || dir == nullptr ||
+	    ImageTrace::g_buffer_dump_budget.load(std::memory_order_relaxed) == 0) {
+		return;
+	}
+	const auto& program = input.stage.module->info;
+	char        hash_text[24];
+	std::snprintf(hash_text, sizeof(hash_text), "%016" PRIx64, program.shader_hash);
+	if (std::strstr(list, hash_text) == nullptr) {
+		return;
+	}
+	ImageTrace::g_buffer_dump_budget.fetch_sub(1, std::memory_order_relaxed);
+	const auto& resources = *input.stage.resources;
+	const auto  flip      = ImageTrace::g_flip.load(std::memory_order_relaxed);
+	constexpr uint64_t MaxBytes = 16ull << 20;
+	vk::MemoryBarrier to_copy {};
+	to_copy.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+	to_copy.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                        vk::PipelineStageFlagBits::eTransfer, {}, 1, &to_copy, 0, nullptr, 0,
+	                        nullptr);
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		const auto& resource   = program.info.buffers[i];
+		const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+		const auto  address    = descriptor.Base48();
+		const auto  size       = std::min<uint64_t>(descriptor.GetSize(), MaxBytes);
+		std::printf("TRACE f=%" PRIu64 " BUF CS=%s b%u addr=%" PRIx64 " size=%" PRIu64
+		            " stride=%u records=%u fmt=%u read=%d written=%d atomic=%d\n",
+		            flip, hash_text, i, address, descriptor.GetSize(), descriptor.Stride(),
+		            descriptor.NumRecords(), descriptor.RawFormat(), resource.read ? 1 : 0,
+		            resource.written ? 1 : 0, resource.atomic ? 1 : 0);
+		if (address == 0 || size == 0 || !context.IsMapped(address, size)) {
+			continue;
+		}
+		const auto [source, offset] = context.GetBufferCache().ObtainBuffer(address, size, false);
+		auto download = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Download)
+		                    .MapDownload(size, 4);
+		const vk::BufferCopy region {offset, download.offset, size};
+		command.copyBuffer(source->Handle(), download.buffer->Handle(), 1, &region);
+		char name[512];
+		std::snprintf(name, sizeof(name), "%s\\buf_f%05" PRIu64 "_%s_b%u_%s_%" PRIx64 "_%" PRIu64
+		              ".bin",
+		              dir, flip, hash_text, i, resource.written ? "w" : "r", address, size);
+		context.GetCommandScheduler().DeferPriorityOperation(
+		    [download = std::move(download), size, path = std::string(name)] {
+			    download.buffer->Invalidate(download.offset, size);
+			    if (std::FILE* out = std::fopen(path.c_str(), "wb"); out != nullptr) {
+				    std::fwrite(download.mapped, 1, static_cast<size_t>(size), out);
+				    std::fclose(out);
+			    }
+		    });
+	}
+	vk::MemoryBarrier to_host {};
+	to_host.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	to_host.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+	                        {}, 1, &to_host, 0, nullptr, 0, nullptr);
+}
+
 void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group_x,
                                     uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
                                     bool async_compute) {
+	Common::PerfStats::ScopedNs perf_timer(Common::PerfStats::g_ns_dispatch);
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -338,10 +438,19 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 
 	const auto& program   = input_info.stage.module->info;
 	const auto& resources = *input_info.stage.resources;
+	ImageTrace::g_cs_hash.store(program.shader_hash, std::memory_order_relaxed);
+	ImageTrace::g_cs_groups.store(uint64_t {input_info.workgroup_counts[0]} |
+	                                  uint64_t {input_info.workgroup_counts[1]} << 21u |
+	                                  uint64_t {input_info.workgroup_counts[2]} << 42u,
+	                              std::memory_order_relaxed);
 	if (resources.specialization_reads.empty() &&
 	    (TryConsumeComputeMetaClear(input_info, buffer) ||
 	     TryConsumeComputeFill(input_info, buffer, thread_group_x, thread_group_y,
 	                           thread_group_z, mode))) {
+		if (ImageTrace::Enabled()) {
+			std::printf("TRACE CONSUMED_AS_CLEAR CS=%016" PRIx64 " groups=%ux%ux%u\n",
+			            program.shader_hash, thread_group_x, thread_group_y, thread_group_z);
+		}
 		ResetBindings();
 		return;
 	}
@@ -469,6 +578,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	DumpShaderBuffers(m_context, input_info, vk_buffer);
 	ResetBindings();
 }
 
@@ -476,6 +586,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
                                       bool async_compute) {
 	EXIT_IF(args_addr == 0 || (args_addr & 3u) != 0 ||
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
+	Common::PerfStats::ScopedNs perf_timer(Common::PerfStats::g_ns_dispatch);
 	m_context.GetCommandScheduler().PopPendingOperations();
 	Common::LockGuard lock(m_context.GetMutex());
 	vk::DispatchIndirectCommand args {};
@@ -493,6 +604,11 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	input_info.indirect_args_address = args_addr;
 	m_context.GetImageHeap().BeginDraw();
 	if (!m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info)) return;
+	ImageTrace::g_cs_hash.store(input_info.stage.module->info.shader_hash,
+	                            std::memory_order_relaxed);
+	ImageTrace::g_cs_groups.store(uint64_t {args.x & 0x1FFFFFu} | uint64_t {args.y & 0x1FFFFFu} << 21u |
+	                                  uint64_t {args.z & 0x1FFFFFu} << 42u | (1ull << 63u),
+	                              std::memory_order_relaxed);
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info);
 	auto& bindings = m_compute_bindings;
@@ -531,7 +647,40 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
+	if (ImageTrace::Enabled()) {
+		// Diagnostic: read back the arguments the GPU actually used for this dispatch.
+		constexpr uint64_t ArgsSize = sizeof(vk::DispatchIndirectCommand);
+		auto download = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Download)
+		                    .MapDownload(ArgsSize, 4);
+		vk::MemoryBarrier to_copy {};
+		to_copy.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+		to_copy.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                          vk::PipelineStageFlagBits::eTransfer, {}, 1, &to_copy, 0,
+		                          nullptr, 0, nullptr);
+		const vk::BufferCopy region {args_offset, download.offset, ArgsSize};
+		vk_buffer.copyBuffer(args_buffer->Handle(), download.buffer->Handle(), 1, &region);
+		vk::MemoryBarrier to_host {};
+		to_host.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		to_host.dstAccessMask = vk::AccessFlagBits::eHostRead;
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                          vk::PipelineStageFlagBits::eHost, {}, 1, &to_host, 0, nullptr, 0,
+		                          nullptr);
+		const uint64_t hash     = program.shader_hash;
+		const uint64_t flip     = ImageTrace::g_flip.load(std::memory_order_relaxed);
+		const bool     in_image = m_context.GetTextureCache().IsRegionRegistered(args_addr, ArgsSize);
+		m_context.GetCommandScheduler().DeferPriorityOperation(
+		    [download = std::move(download), hash, flip, args_addr, in_image] {
+			    download.buffer->Invalidate(download.offset, ArgsSize);
+			    vk::DispatchIndirectCommand used {};
+			    std::memcpy(&used, download.mapped, sizeof(used));
+			    std::printf("TRACE f=%" PRIu64 " ARGS CS=%016" PRIx64 " addr=%" PRIx64
+			                " groups=%ux%ux%u args_inside_image=%d\n",
+			                flip, hash, args_addr, used.x, used.y, used.z, in_image ? 1 : 0);
+		    });
+	}
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	DumpShaderBuffers(m_context, input_info, vk_buffer);
 	ResetBindings();
 }
 

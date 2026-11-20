@@ -152,6 +152,10 @@ struct EmitterState {
 	const IR::Block*           current_block                         = nullptr;
 	uint32_t                   pixel_valid_mask_variable             = 0;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
+	// Compute workgroups larger than one host subgroup: local IDs come from SubgroupId and the
+	// subgroup lane so lane N of wave W is local index W * wave + N, as on the guest.
+	bool                       lane_remap                            = false;
+	uint32_t                   subgroup_id_variable                  = 0;
 	uint32_t                   helper_invocation_variable            = 0;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;
@@ -161,6 +165,11 @@ struct EmitterState {
 	uint32_t                   cull_distance_variable                = 0;
 	uint32_t                   layer_variable                        = 0;
 	uint32_t                   viewport_index_variable               = 0;
+	// Layer chunks (MeshLayerChunk): the mesh writes its chunk to ViewportIndex and a pixel
+	// shader that reads Layer adds ViewportIndex * chunk size back.
+	uint32_t                   mesh_chunk_viewport                   = 0;
+	bool                       mesh_chunk_viewport_in_block          = false;
+	uint32_t                   chunk_viewport_input                  = 0;
 	uint32_t                   depth_variable                        = 0;
 	uint32_t                   object_primitive_id_variable          = 0;
 	uint32_t                   sample_mask_variable                  = 0;
@@ -370,6 +379,8 @@ void     DefineTessellationExecutionModes(EmitterState& state);
 void     DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
                            uint32_t cull_distance_count);
 void     EmitMeshEntryPoint(EmitterState& state);
+// Layers per chunk of a mesh shader that writes Layer on a host with few mesh layers, else 0.
+uint32_t MeshLayerChunk(const EmitterState& state);
 uint32_t MeshOutputPointer(EmitterState& state, IR::StageOutputKind kind, uint32_t index = 0);
 uint32_t MeshPrimitivePointer(EmitterState& state);
 

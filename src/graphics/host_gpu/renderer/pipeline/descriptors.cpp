@@ -32,9 +32,11 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -520,7 +522,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	// IMAGE_STORE addresses BASE_LEVEL; only IMAGE_STORE_MIP selects other view mips.
 	const bool single_storage_mip =
 	    storage && resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic;
-	const auto view_levels = multisampled || single_storage_mip
+	auto view_levels = multisampled || single_storage_mip
 	                             ? 1u
 	                             : static_cast<uint32_t>(last_level - base_level) + 1u;
 	auto levels =
@@ -598,9 +600,37 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		desc.info.metadata.kind = ImageMetadataKind::Dcc;
 	}
 	if (levels > physical_levels) {
-		if (!ResolveTextureMipView(desc.info, physical_levels,
-		                           !resource.r128 && descriptor.MetaCompress(), view_levels,
-		                           view_base)) {
+		static const bool strict_mip_view = std::getenv("KYTY_MIP_VIEW_STRICT") != nullptr;
+		if (ResolveTextureMipView(desc.info, physical_levels,
+		                          !resource.r128 && descriptor.MetaCompress(), view_levels,
+		                          view_base)) {
+			// resolved: same stored subresources under other mip indices
+		} else if (!strict_mip_view && base_level >= physical_levels) {
+			// The view starts past MAX_MIP and no stored chain matches it (PPSA21564 Astro Bot samples
+			// mip 6 of a 1920x1080 target whose T# stops at MAX_MIP 5, right at its ps_logo level).
+			// Clamp to the last stored mip instead of exiting: a slightly blurrier sample beats a
+			// crash. KYTY_MIP_VIEW_STRICT=1 restores the exit.
+			static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+			if (!warned.test_and_set(std::memory_order_relaxed)) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "Warning: texture view past MAX_MIP (base={} last={} max={} extent={}x{}); "
+				    "using the last stored mip\n",
+				    base_level, last_level, max_mip, width, height));
+			}
+			// KYTY_MIP_PAST=null binds nothing instead (reads zero): diagnostic to tell whether the
+			// clamped sample is what shifts the image (Astro Bot desert looks washed out).
+			static const bool past_null = [] {
+				const char* mode = std::getenv("KYTY_MIP_PAST");
+				return mode != nullptr && std::string_view(mode) == "null";
+			}();
+			if (past_null) {
+				return {.layout = vk::ImageLayout::eGeneral};
+			}
+			desc.info.resources.levels = physical_levels;
+			desc.info.UpdateSize();
+			view_base   = physical_levels - 1u;
+			view_levels = 1u;
+		} else {
 			EXIT("unsupported texture mip view changes physical layout: base=%u last=%u max=%u "
 			     "extent=%ux%ux%u tile=%u\n",
 			     base_level, last_level, max_mip, width, height, depth,

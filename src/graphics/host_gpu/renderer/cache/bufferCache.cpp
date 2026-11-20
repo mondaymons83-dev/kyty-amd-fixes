@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -15,7 +16,9 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <utility>
@@ -226,9 +229,15 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if constexpr (async) {
 		m_scheduler.DeferPriorityOperation(std::move(publish));
 	} else {
-		const auto tick = m_scheduler.CurrentTick();
+		const auto tick       = m_scheduler.CurrentTick();
+		const auto wait_start = std::chrono::steady_clock::now();
 		m_scheduler.Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
+		Common::PerfStats::Bump(Common::PerfStats::g_sync_downloads);
+		Common::PerfStats::Bump(Common::PerfStats::g_sync_wait_ns,
+		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                              std::chrono::steady_clock::now() - wait_start)
+		                              .count()));
 		publish();
 	}
 	return true;
@@ -291,13 +300,17 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	QueueBdaSync(vaddr, size, true);
 }
 
-void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool from_fault) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+	// Experiment (FPS ceiling): a guest read of GPU-written memory drains the whole
+	// GPU queue. KYTY_ASYNC_READBACK=1 gives the guest the stale CPU copy instead, to measure how
+	// many FPS the drains cost. It can show old data to the game; never leave it on by default.
+	static const bool stale_reads = std::getenv("KYTY_ASYNC_READBACK") != nullptr;
+	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, from_fault] {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
@@ -307,7 +320,46 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			    std::max(Common::AlignDown(vaddr, DownloadWindowSize), buffer.CpuAddress());
 			const auto end = std::min(std::max(start + DownloadWindowSize, vaddr + size),
 			                          buffer.CpuAddress() + buffer.Size());
-			if (DownloadBufferMemory<false>(buffer, start, end - start)) {
+			// a page downloaded ahead of time by PrefetchHotReadbacks only needs
+			// that older download, unless the GPU wrote the page again since then.
+			const auto page = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+			if (from_fault && !is_write && vaddr + size <= page + TRACKER_PAGE_SIZE &&
+			    !m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE)) {
+				const auto found = m_prefetched_pages.find(page);
+				if (found != m_prefetched_pages.end()) {
+					const auto tick = found->second;
+					m_prefetched_pages.erase(found);
+					m_scheduler.Wait(tick);
+					m_scheduler.WaitPriorityOperations(tick);
+					m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+					Common::PerfStats::Bump(Common::PerfStats::g_prefetch_hits);
+					return;
+				}
+			}
+			// Any prefetched page inside the window: its bytes are already left out of the GPU
+			// ranges, so publish those downloads before releasing the window below.
+			uint64_t prefetch_tick = 0;
+			for (auto it = m_prefetched_pages.lower_bound(Common::AlignDown(start, TRACKER_PAGE_SIZE));
+			     it != m_prefetched_pages.end() && it->first < end;) {
+				prefetch_tick = std::max(prefetch_tick, it->second);
+				it            = m_prefetched_pages.erase(it);
+			}
+			if (prefetch_tick != 0) {
+				m_scheduler.Wait(prefetch_tick);
+				m_scheduler.WaitPriorityOperations(prefetch_tick);
+			}
+			Common::PerfStats::g_pages_sync_download.Add(vaddr);
+			if (stale_reads && from_fault && !is_write) {
+				m_memory_tracker.ForEachDownloadRange<false>(
+				    start, end - start, [&](uint64_t address, uint64_t bytes) noexcept {
+					    m_gpu_modified_ranges.Subtract(address, bytes);
+					    ForgetColorMetadataChecks(address, bytes);
+				    });
+				m_memory_tracker.UnmarkRegionAsGpuModified(start, end - start);
+				Common::PerfStats::Bump(Common::PerfStats::g_stale_reads);
+				return;
+			}
+			if (DownloadBufferMemory<false>(buffer, start, end - start) || prefetch_tick != 0) {
 				m_memory_tracker.UnmarkRegionAsGpuModified(start, end - start);
 			}
 		}
@@ -686,7 +738,14 @@ void BufferCache::RunGarbageCollector() {
 			return false;
 		}
 		if (dirty) {
-			EXIT_NOT_IMPLEMENTED(!DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size()));
+			// A prefetched page leaves the tracker dirty with no GPU ranges left to copy; the
+			// wait for the current tick below also publishes that older download.
+			const bool queued = DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size());
+			EXIT_NOT_IMPLEMENTED(!queued && m_prefetched_pages.empty());
+			for (auto it = m_prefetched_pages.lower_bound(buffer.CpuAddress());
+			     it != m_prefetched_pages.end() && it->first < buffer.CpuAddress() + buffer.Size();) {
+				it = m_prefetched_pages.erase(it);
+			}
 			dirty_buffers.push_back(id);
 		} else {
 			m_memory_tracker.MarkRegionAsCpuModified(buffer.CpuAddress(), buffer.Size());
@@ -709,6 +768,49 @@ void BufferCache::RunGarbageCollector() {
 		m_memory_tracker.MarkRegionAsCpuModified(buffer.CpuAddress(), buffer.Size());
 		Unregister(id);
 		m_slot_buffers.erase(id);
+	}
+}
+
+void BufferCache::NoteGuestReadFault(uint64_t vaddr) {
+	std::scoped_lock lock(m_hot_read_mutex);
+	m_hot_read_pages[Common::AlignDown(vaddr, TRACKER_PAGE_SIZE)] = m_current_flip;
+}
+
+void BufferCache::PrefetchHotReadbacks(uint64_t flip) {
+	static const bool disabled = std::getenv("KYTY_NO_PREFETCH_READBACK") != nullptr;
+	constexpr uint64_t HotFlips = 60; // a page stays hot this many flips after its last read fault
+	m_current_flip = flip;
+	if (disabled) {
+		return;
+	}
+	std::vector<uint64_t> pages;
+	{
+		std::scoped_lock lock(m_hot_read_mutex);
+		for (auto it = m_hot_read_pages.begin(); it != m_hot_read_pages.end();) {
+			if (flip > it->second + HotFlips) {
+				it = m_hot_read_pages.erase(it);
+			} else {
+				pages.push_back(it->first);
+				++it;
+			}
+		}
+	}
+	for (const auto page: pages) {
+		if (!IsRegionRegistered(page, TRACKER_PAGE_SIZE) ||
+		    !m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE)) {
+			continue;
+		}
+		auto& buffer = m_slot_buffers[FindBuffer(page, TRACKER_PAGE_SIZE)];
+		const auto start = std::max(page, buffer.CpuAddress());
+		const auto end   = std::min(page + TRACKER_PAGE_SIZE, buffer.CpuAddress() + buffer.Size());
+		if (start >= end) {
+			continue;
+		}
+		const auto tick = m_scheduler.CurrentTick();
+		if (DownloadBufferMemory<true>(buffer, start, end - start)) {
+			m_prefetched_pages[page] = tick;
+			Common::PerfStats::Bump(Common::PerfStats::g_prefetches);
+		}
 	}
 }
 

@@ -24,6 +24,7 @@
 #include "libs/libs.h"
 #include "loader/systemContent.h"
 
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1709,8 +1710,13 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	                         (attribute & 0x20000000) != 0;
 	ctx->mutex.Lock();
 	// Primary output reports 4K unless param.json Video-out Info enables resolution detection.
+	// KYTY_VIDEOOUT_1080P=1 reports 1080p to every game, so it renders a quarter of the pixels.
+	static const bool force_1080p = std::getenv("KYTY_VIDEOOUT_1080P") != nullptr;
 	status->resolution =
-	    ((attribute3 & 4) != 0 && driver.width < 3840 && driver.height < 2160 ? 1u : 2u);
+	    force_1080p ||
+	            ((attribute3 & 4) != 0 && driver.width < 3840 && driver.height < 2160)
+	        ? 1u
+	        : 2u;
 	status->dynamicRange = hdr_allowed && driver.IsHdrSupported() ? 2u : 1u;
 	status->refreshRate =
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119

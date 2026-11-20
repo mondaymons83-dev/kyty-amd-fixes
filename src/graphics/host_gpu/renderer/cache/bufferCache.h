@@ -56,7 +56,8 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
-	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	// from_fault: a guest CPU read; KYTY_ASYNC_READBACK=1 then serves stale CPU data (experiment).
+	void ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false, bool from_fault = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
@@ -98,6 +99,13 @@ public:
 	// A write queues only the pages a DMA shader accessed.
 	void               QueueBdaSync(uint64_t vaddr, uint64_t size, bool is_write = false);
 	void               RunGarbageCollector();
+	// called on the GPU thread at each flip. Pages the guest keeps reading back
+	// get their GPU-written bytes downloaded asynchronously, so the later guest read waits only
+	// for that older download instead of draining the whole queue. KYTY_NO_PREFETCH_READBACK=1
+	// turns it off.
+	void PrefetchHotReadbacks(uint64_t flip);
+	// Any thread: a guest CPU read fault on this page (feeds the hot set).
+	void NoteGuestReadFault(uint64_t vaddr);
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -151,6 +159,10 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	std::mutex                                        m_hot_read_mutex;
+	std::map<uint64_t, uint64_t>                      m_hot_read_pages;   // page -> last fault flip
+	std::map<uint64_t, uint64_t>                      m_prefetched_pages; // page -> download tick (GPU thread)
+	uint64_t                                          m_current_flip = 0;
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
 	MemoryTracker                                     m_memory_tracker;

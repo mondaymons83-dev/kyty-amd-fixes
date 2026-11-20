@@ -59,6 +59,12 @@ void InitializeThreads() {
 	g_main_thread = std::this_thread::get_id();
 }
 
+void Thread::RaiseCurrentThreadPriority() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#endif
+}
+
 void Thread::SleepMicro(uint32_t micros) {
 	SleepNano(uint64_t {micros} * 1000);
 }

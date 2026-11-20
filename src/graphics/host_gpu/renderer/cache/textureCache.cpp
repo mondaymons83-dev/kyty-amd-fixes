@@ -5,6 +5,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/tile.h"
@@ -18,6 +19,14 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <unordered_map>
+#include <string>
+#include <vector>
+#include <xxhash.h>
 #include <array>
 #include <bit>
 #include <cinttypes>
@@ -30,6 +39,79 @@
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
+
+namespace ImageTrace {
+// Diagnostic only: KYTY_TRACE=WxH[:fmt,fmt...] logs cache events of matching images from flip
+// KYTY_TRACE_FROM on (default 0).
+std::atomic<uint64_t> g_flip {0};
+std::atomic<uint64_t> g_cs_hash {0};
+std::atomic<uint32_t> g_buffer_dump_budget {0};
+
+const char* DumpDir() {
+	static const char* dir = std::getenv("KYTY_DUMP_DIR");
+	return dir;
+}
+std::atomic<uint64_t> g_cs_groups {0};
+
+struct Filter {
+	bool                  enabled = false;
+	uint32_t              width   = 0;
+	uint32_t              height  = 0;
+	std::vector<uint32_t> formats;
+	uint64_t              from = 0;
+};
+
+const Filter& Get() {
+	static const Filter filter = [] {
+		Filter      f;
+		const char* spec = std::getenv("KYTY_TRACE");
+		if (spec == nullptr) {
+			return f;
+		}
+		const char* colon = std::strchr(spec, ':');
+		f.enabled = std::sscanf(spec, "%ux%u", &f.width, &f.height) == 2;
+		for (const char* p = colon; p != nullptr && *p != '\0'; p = std::strchr(p, ',')) {
+			f.formats.push_back(static_cast<uint32_t>(std::strtoul(p + 1, nullptr, 10)));
+			p++;
+		}
+		if (const char* from = std::getenv("KYTY_TRACE_FROM"); from != nullptr) {
+			f.from = std::strtoull(from, nullptr, 10);
+		}
+		return f;
+	}();
+	return filter;
+}
+
+bool Enabled() {
+	return Get().enabled && g_flip.load(std::memory_order_relaxed) >= Get().from;
+}
+
+bool MatchesExtent(uint32_t width, uint32_t height) {
+	return Enabled() && width == Get().width && height == Get().height;
+}
+
+bool Matches(const Image& image) {
+	const auto& f = Get();
+	if (!f.enabled || g_flip.load(std::memory_order_relaxed) < f.from ||
+	    image.info.extent.width != f.width || image.info.extent.height != f.height) {
+		return false;
+	}
+	const auto fmt = static_cast<uint32_t>(image.info.pixel_format);
+	return f.formats.empty() || std::find(f.formats.begin(), f.formats.end(), fmt) != f.formats.end();
+}
+
+void Log(const Image& image, const char* event, const char* extra = "") {
+	if (!Matches(image)) {
+		return;
+	}
+	std::printf("TRACE f=%" PRIu64 " s%06" PRIu64 " fmt%u addr=%" PRIx64 "+%" PRIx64
+	            " %s gpu=%d buf=%d cpu=%d rt=%d %s\n",
+	            g_flip.load(std::memory_order_relaxed), image.serial,
+	            static_cast<uint32_t>(image.info.pixel_format), image.info.data.address,
+	            image.info.data.size, event, image.IsGpuModified(), image.IsBufferModified(),
+	            image.IsCpuDirty(), image.usage.render_target, extra);
+}
+} // namespace ImageTrace
 
 namespace {
 
@@ -136,6 +218,16 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		m_critical_gc_memory = static_cast<uint64_t>(
 		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
 		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+		// on a 16 GB card the trigger landed at ~3 GB while DBZ keeps ~5.4 GB
+		// live, so the collector evicted 80-100 images a second that the game then recreated.
+		// Start collecting at 60% of the budget, still below the pressure level.
+		// KYTY_GC_OLD_LIMITS=1 restores the old trigger.
+		if (std::getenv("KYTY_GC_OLD_LIMITS") == nullptr) {
+			const auto roomy = std::min<int64_t>(budget * 6 / 10,
+			    static_cast<int64_t>(m_pressure_gc_memory) - GiB / 2);
+			m_trigger_gc_memory = static_cast<uint64_t>(
+			    std::max<int64_t>(roomy, static_cast<int64_t>(m_trigger_gc_memory)));
+		}
 	}
 }
 
@@ -147,8 +239,26 @@ TextureCache::~TextureCache() {
 	});
 }
 
+// DBZ (UE) places an 11_11_10 float HDR scene target and a 10_10_10_2 UNorm target at the same
+// address. Sharing one backing let the 10_10_10_2 writes land in the HDR image, whose readers
+// then decoded UNorm bits as packed floats: the rainbow. Packed-float formats get their own
+// backing; KYTY_SHARE_PACKED_FLOAT=1 restores sharing.
+static bool PackedFloatMismatch(vk::Format a, vk::Format b) {
+	static const bool share = std::getenv("KYTY_SHARE_PACKED_FLOAT") != nullptr;
+	if (share || a == b) {
+		return false;
+	}
+	const auto packed = [](vk::Format f) {
+		return f == vk::Format::eB10G11R11UfloatPack32 || f == vk::Format::eE5B9G9R9UfloatPack32;
+	};
+	return packed(a) || packed(b);
+}
+
 bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& requested,
                                bool exact_format) {
+	if (PackedFloatMismatch(cached.pixel_format, requested.pixel_format)) {
+		return false;
+	}
 	if (cached.data.address != requested.data.address) {
 		return false;
 	}
@@ -277,6 +387,7 @@ void TextureCache::DeleteImage(ImageId id) {
 }
 
 void TextureCache::FreeImage(ImageId id) {
+	ImageTrace::Log(m_slot_images[id], "free");
 	m_slot_images[id].ClearGpuModified();
 	DeleteImage(id);
 }
@@ -542,6 +653,12 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	    (source.backing.format == destination.backing.format ||
 	     (!source_depth && !dest_depth &&
 	      vk::blockSize(source.backing.format) == vk::blockSize(destination.backing.format)));
+	if (ImageTrace::Matches(destination)) {
+		char extra[96];
+		std::snprintf(extra, sizeof(extra), "from s%06" PRIu64 " fmt%u", source.serial,
+		              static_cast<uint32_t>(source.info.pixel_format));
+		ImageTrace::Log(destination, "copy_image", extra);
+	}
 	if (direct_copy) {
 		destination.CopyImage(source);
 	} else if (!CopyD16(destination, source)) {
@@ -814,6 +931,9 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (requested.type != cached.info.type) {
 			return {merged_id};
 		}
+		if (PackedFloatMismatch(requested.pixel_format, cached.info.pixel_format)) {
+			return {merged_id};
+		}
 		if (requested.pixel_format != cached.info.pixel_format ||
 		    requested.data.size <= cached.info.data.size) {
 			const auto result_id = merged_id ? merged_id : cached_id;
@@ -955,9 +1075,111 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureUploadBytes, linear.size);
 }
 
+// KYTY_UPLOAD_STATS=1: every 5 s, print texture upload bytes by cause, bytes whose guest contents
+// hash equal to that image's previous upload (re-uploads of untouched data), the top images, and
+// semaphore wait time per thread.
+extern std::atomic<uint64_t> g_stats_wait_ns_gpu_thread, g_stats_wait_ns_other,
+    g_stats_waits_gpu_thread, g_stats_waits_other;
+
+namespace UploadStats {
+struct Entry {
+	uint64_t    size = 0, bytes = 0, uploads = 0, repeated = 0, last_hash = 0;
+	uint32_t    mips = 0, layers = 0, tile = 0, width = 0, height = 0;
+	vk::Format  format {};
+	const char* cause = "";
+};
+static std::mutex                          g_mutex;
+static std::unordered_map<uint64_t, Entry> g_images;
+static uint64_t g_bytes_cpu = 0, g_bytes_maybe = 0, g_bytes_buffer = 0, g_bytes_repeated = 0;
+static std::unordered_map<std::string, std::array<uint64_t, 2>> g_clear_calls; // checks, clears
+static auto     g_last_print = std::chrono::steady_clock::now();
+
+static bool Enabled() {
+	static const bool enabled = std::getenv("KYTY_UPLOAD_STATS") != nullptr;
+	return enabled;
+}
+
+static void Print(double seconds) {
+	const double mb = 1024.0 * 1024.0;
+	std::printf("[upload-stats] %.1fs: total %.0f MB/s | cpu-dirty %.0f | maybe-dirty %.0f | "
+	            "buffer-modified %.0f | SAME-CONTENT %.0f MB/s\n",
+	            seconds, (g_bytes_cpu + g_bytes_maybe + g_bytes_buffer) / mb / seconds,
+	            g_bytes_cpu / mb / seconds, g_bytes_maybe / mb / seconds,
+	            g_bytes_buffer / mb / seconds, g_bytes_repeated / mb / seconds);
+	std::printf("[upload-stats] waits: gpu-thread %.0f ms/s (%.0f/s) | other threads %.0f ms/s "
+	            "(%.0f/s)\n",
+	            g_stats_wait_ns_gpu_thread.exchange(0) / 1e6 / seconds,
+	            g_stats_waits_gpu_thread.exchange(0) / seconds,
+	            g_stats_wait_ns_other.exchange(0) / 1e6 / seconds,
+	            g_stats_waits_other.exchange(0) / seconds);
+	std::vector<std::pair<uint64_t, Entry>> top(g_images.begin(), g_images.end());
+	std::sort(top.begin(), top.end(),
+	          [](const auto& a, const auto& b) { return a.second.bytes > b.second.bytes; });
+	for (size_t i = 0; i < std::min<size_t>(5, top.size()); i++) {
+		const auto& [address, e] = top[i];
+		if (e.bytes == 0) break;
+		std::printf("[upload-stats]   #%zu 0x%010" PRIx64 " %ux%u %s mips=%u layers=%u tile=%u "
+		            "size=%.1fMB uploads=%" PRIu64 " (%.0f MB/s, same-content %" PRIu64 ") %s\n",
+		            i + 1, address, e.width, e.height, vk::to_string(e.format).c_str(), e.mips,
+		            e.layers, e.tile, e.size / mb, e.uploads, e.bytes / mb / seconds, e.repeated,
+		            e.cause);
+	}
+	std::vector<std::pair<std::string, std::array<uint64_t, 2>>> cl(g_clear_calls.begin(),
+	                                                                g_clear_calls.end());
+	std::sort(cl.begin(), cl.end(), [](const auto& a, const auto& b) { return a.second[1] > b.second[1]; });
+	for (size_t i = 0; i < std::min<size_t>(6, cl.size()); i++) {
+		std::printf("[clear-stats] %s: %.0f checks/s, %.0f clears/s\n", cl[i].first.c_str(),
+		            cl[i].second[0] / seconds, cl[i].second[1] / seconds);
+	}
+	g_clear_calls.clear();
+	std::fflush(stdout);
+	for (auto& [address, e]: g_images) {
+		e.bytes = 0; e.uploads = 0; e.repeated = 0;
+	}
+	g_bytes_cpu = g_bytes_maybe = g_bytes_buffer = g_bytes_repeated = 0;
+}
+
+static void Record(const Image& image) {
+	const auto& info  = image.info;
+	const char* cause = image.IsBufferModified()       ? "buffer-modified"
+	                    : image.IsDefinitelyCpuDirty() ? "cpu-dirty"
+	                                                   : "maybe-dirty";
+	std::vector<uint8_t> bytes(info.data.size);
+	uint64_t             hash = 0;
+	if (LibKernel::Memory::TryReadBacking(info.data.address, bytes.data(), bytes.size())) {
+		hash = XXH3_64bits(bytes.data(), bytes.size());
+	}
+	std::scoped_lock lock(g_mutex);
+	auto&            e = g_images[info.data.address];
+	const bool       same = hash != 0 && e.uploads + e.repeated > 0 && hash == e.last_hash;
+	e.size = info.data.size; e.mips = info.resources.levels; e.layers = info.resources.layers;
+	e.tile = static_cast<uint32_t>(info.tile_mode); e.width = info.extent.width;
+	e.height = info.extent.height; e.format = info.pixel_format; e.cause = cause;
+	e.bytes += info.data.size; e.uploads++; e.last_hash = hash;
+	if (same) { e.repeated++; g_bytes_repeated += info.data.size; }
+	(cause[0] == 'b' ? g_bytes_buffer : cause[0] == 'c' ? g_bytes_cpu : g_bytes_maybe) +=
+	    info.data.size;
+	const auto now     = std::chrono::steady_clock::now();
+	const auto seconds = std::chrono::duration<double>(now - g_last_print).count();
+	if (seconds >= 5.0) {
+		Print(seconds);
+		g_last_print = now;
+	}
+}
+} // namespace UploadStats
+
 void TextureCache::InitializeImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	TrackImage(id);
+	// Images that cannot upload start with undefined host contents: AMD's Windows driver hands out
+	// garbage, RADV mostly zeros. KYTY_ZERO_INIT=1 (experiment; did not fix DBZ's rainbow) clears them.
+	static const bool zero_init = std::getenv("KYTY_ZERO_INIT") != nullptr;
+	const bool        cannot_upload =
+	    image.info.metadata.compression != VideoOutCompression::Uncompressed ||
+	    image.info.samples > 1;
+	if (cannot_upload && zero_init && !image.IsGpuModified()) {
+		image.ZeroFillOnce();
+	}
 	if (image.info.metadata.compression != VideoOutCompression::Uncompressed) {
 		image.RefreshComplete();
 		return;
@@ -966,7 +1188,22 @@ void TextureCache::InitializeImage(ImageId id) {
 		return;
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
+	// KYTY_SKIP_RT_REUPLOAD=1 (experiment): a render or depth target marked only by a buffer write
+	// keeps its GPU contents instead of being re-copied from the buffer every frame.
+	static const bool skip_rt_reupload = std::getenv("KYTY_SKIP_RT_REUPLOAD") != nullptr;
+	if (upload && skip_rt_reupload && image.IsBufferModified() && !image.IsCpuDirty()) {
+		const auto binding = image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
+		if (binding == BindingType::RenderTarget || binding == BindingType::DepthTarget) {
+			image.ClearBufferModified();
+			image.RefreshComplete();
+			return;
+		}
+	}
 	if (upload) {
+		ImageTrace::Log(image, "UPLOAD_FROM_MEMORY");
+		if (UploadStats::Enabled()) {
+			UploadStats::Record(image);
+		}
 		const auto [source, source_offset] =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
 		if (source == nullptr) {
@@ -1029,6 +1266,12 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	const GuestRange viewed {range.address + slice_size * first + mip.offset,
 	                         slice_size * (count - 1) + mip.size};
 	const auto run = [&](uint32_t slice) { return viewed.address + slice_size * slice; };
+	// KYTY_SKIP_COLOR_META_CLEAR=1 (experiment): skip the per-key predicated clears that apply
+	// GPU-written fast-clear metadata, to measure what they cost.
+	static const bool skip_meta_clear = std::getenv("KYTY_SKIP_COLOR_META_CLEAR") != nullptr;
+	if (skip_meta_clear && m_buffer_cache.IsRegionGpuModified(viewed.address, viewed.size)) {
+		return;
+	}
 	if (m_buffer_cache.IsRegionGpuModified(viewed.address, viewed.size)) {
 		std::array<vk::ClearAttachment, TileManager::ColorClearSlots> clears {};
 		uint32_t keys = 0;
@@ -1071,6 +1314,54 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 				    {buffer->Handle(), offset, viewed.size}, slice_size, count, keys, expand);
 				for (uint32_t slice = 0; slice < count && expand; slice++) {
 					m_buffer_cache.MarkColorMetadataChecked(run(slice), mip.size, keys);
+				}
+				if (UploadStats::Enabled()) {
+					std::scoped_lock stats_lock(UploadStats::g_mutex);
+					char key_text[160];
+					std::snprintf(key_text, sizeof(key_text), "%ux%u %s view=%s fmt=%s count=%u keys=%u",
+					              desc.info.extent.width, desc.info.extent.height,
+					              volume_texture ? "3D" : "2D", vk::to_string(view.type).c_str(),
+					              vk::to_string(view.format).c_str(), count, std::popcount(keys));
+					auto& c = UploadStats::g_clear_calls[key_text];
+					c[0] += 1;
+					c[1] += static_cast<uint64_t>(count) * std::popcount(keys);
+				}
+				// Many-slice targets: one compute dispatch writes each slice's hit key instead of
+				// count * keys predicated clears (64-slice targets cost ~320 clears per check).
+				static const bool no_fast_apply = std::getenv("KYTY_NO_FAST_CLEAR_APPLY") != nullptr;
+				const auto numeric = vk::componentNumericFormat(view.format, 0);
+				const bool float_format = std::strcmp(numeric, "UINT") != 0 &&
+				                          std::strcmp(numeric, "SINT") != 0;
+				if (!no_fast_apply && count >= 8 && float_format &&
+				    (image.backing.usage & vk::ImageUsageFlagBits::eStorage) &&
+				    (m_graphics.GetFormatProperties(view.format).optimalTilingFeatures &
+				     vk::FormatFeatureFlagBits::eStorageImage)) {
+					// A 3D image is always written through a 3D view: a 2D-array view of a 3D image
+					// is valid only as an attachment, not as a storage image. AMD's Windows driver
+					// tiles 3D images differently and scrambles them when written that way (DBZ's
+					// 64^3 color-grading LUT, viewed as 64 layers, came out as a rainbow). Slices of
+					// such a 2D-array view are depth slices, starting at its base layer.
+					const bool image_3d = desc.info.IsVolume();
+					ImageViewInfo storage {};
+					storage.format      = view.format;
+					storage.type        = image_3d ? vk::ImageViewType::e3D : vk::ImageViewType::e2DArray;
+					storage.base_level  = view.base_level;
+					storage.base_layer  = image_3d ? 0u : image_first;
+					storage.layer_count = image_3d ? 1u : count;
+					storage.usage       = vk::ImageUsageFlagBits::eStorage;
+					m_scheduler.EndRendering();
+					image.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderStorageWrite,
+					              {}, m_scheduler.Current().Handle());
+					std::array<vk::ClearColorValue, TileManager::ColorClearSlots> colors {};
+					for (uint32_t key = 0; key < colors.size(); key++) {
+						colors[key] = clears[key].clearValue.color;
+					}
+					m_tiler.ApplyColorClear(predicates, image.FindView(storage), image_3d,
+					                        std::max(image.info.extent.width >> view.base_level, 1u),
+					                        std::max(image.info.extent.height >> view.base_level, 1u),
+					                        count, image_3d ? image_first : 0u, keys, colors);
+					CommitGpuWrite(image);
+					return;
 				}
 				const auto command = m_scheduler.Current().Handle();
 				const auto area    = BeginColorRendering(image, view.format, view.base_level,
@@ -1229,6 +1520,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+	Common::PerfStats::ScopedNs perf_timer(Common::PerfStats::g_ns_find_image);
 	ValidateImageDesc(desc);
 	EXIT_IF(desc.info.data.Empty());
 	const auto metadata_base_layer = desc.view_info.base_layer;
@@ -1317,6 +1609,31 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			                                    inserted.info.data.size)) {
 				inserted.MarkBufferModified();
 			}
+			// PPSA15210 (UE transient pool): a float image first found as a storage target is a
+			// fresh render-graph texture whose contents are undefined. Uploading the stale guest
+			// bytes of whatever used the memory before read back as NaN/Inf packed floats; when
+			// tile classification then skipped every tile, the bloom spread them (the rainbow).
+			// Start it at zero instead. KYTY_UPLOAD_NEW_STORAGE=1 restores the upload.
+			static const bool upload_new_storage = std::getenv("KYTY_UPLOAD_NEW_STORAGE") != nullptr;
+			const auto        numeric = vk::componentNumericFormat(inserted.info.pixel_format, 0);
+			const bool        float_format =
+			    std::strcmp(numeric, "SFLOAT") == 0 || std::strcmp(numeric, "UFLOAT") == 0;
+			// Bloom render targets reuse the same pool and accumulate with additive blending.
+			const bool fresh_target =
+			    desc.type == BindingType::Storage || desc.type == BindingType::RenderTarget;
+			if (!upload_new_storage && fresh_target && float_format &&
+			    inserted.info.samples == 1 && !inserted.info.IsDepth() &&
+			    inserted.info.metadata.compression == VideoOutCompression::Uncompressed) {
+				TrackImage(result);
+				inserted.ClearBufferModified();
+				inserted.RefreshComplete();
+				inserted.ZeroFillOnce();
+				ImageTrace::Log(inserted, "zero_filled_new_storage");
+			}
+			ImageTrace::Log(inserted, "new", desc.type == BindingType::Storage ? "for=storage"
+			                                 : desc.type == BindingType::RenderTarget
+			                                     ? "for=rt"
+			                                     : "for=other");
 		}
 		auto& image = m_slot_images[result];
 		if (view_mip >= 0) {
@@ -1327,6 +1644,32 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		}
 		image.tick_accessed_last = m_gc_tick;
 		TouchImage(image);
+	}
+	if (ImageTrace::Get().enabled && desc.info.extent.width == ImageTrace::Get().width &&
+	    desc.info.extent.height == ImageTrace::Get().height &&
+	    ImageTrace::g_flip.load(std::memory_order_relaxed) >= ImageTrace::Get().from) {
+		const auto& found = m_slot_images[result];
+		const auto groups = ImageTrace::g_cs_groups.load(std::memory_order_relaxed);
+		std::printf("TRACE f=%" PRIu64 " CS=%016" PRIx64 " groups=%ux%ux%u%s\n",
+		            ImageTrace::g_flip.load(std::memory_order_relaxed),
+		            ImageTrace::g_cs_hash.load(std::memory_order_relaxed),
+		            static_cast<uint32_t>(groups & 0x1FFFFF),
+		            static_cast<uint32_t>((groups >> 21) & 0x1FFFFF),
+		            static_cast<uint32_t>((groups >> 42) & 0x1FFFFF),
+		            (groups >> 63) != 0 ? " INDIRECT" : "");
+		std::printf("TRACE f=%" PRIu64 " FIND %s addr=%" PRIx64 " want_fmt%u guest%u tile%u view_fmt%u"
+		            " meta%u -> s%06" PRIu64 " fmt%u\n",
+		            ImageTrace::g_flip.load(std::memory_order_relaxed),
+		            desc.type == BindingType::Storage        ? "storage"
+		            : desc.type == BindingType::RenderTarget ? "rt"
+		            : desc.type == BindingType::Texture      ? "texture"
+		                                                     : "other",
+		            desc.info.data.address, static_cast<uint32_t>(desc.info.pixel_format),
+		            static_cast<uint32_t>(desc.info.guest_format),
+		            static_cast<uint32_t>(desc.info.tile_mode),
+		            static_cast<uint32_t>(desc.view_info.format),
+		            static_cast<uint32_t>(desc.info.metadata.kind), found.serial,
+		            static_cast<uint32_t>(found.info.pixel_format));
 	}
 	MaterializeColorClear(result, desc, metadata_base_layer);
 	if (desc.type == BindingType::VideoOut &&
@@ -1396,6 +1739,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	const bool first_write =
 	    m_readback_storage_images && (!image.IsGpuModified() || image.IsDefinitelyCpuDirty()) &&
 	    !m_buffer_cache.HasOnlyGpuDirtyBytes(image.info.data.address, image.info.data.size);
+	ImageTrace::Log(image, desc.type == BindingType::Storage ? "bind_storage" : "bind_texture");
 	RefreshImage(id);
 	if (image.info.HasStencil() &&
 	    desc.info.data.address >= image.info.stencil.address &&
@@ -1425,6 +1769,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 		EXIT("TextureCache: color target requires rediscovery before final acquisition\n");
 	}
 	TouchImage(image);
+	ImageTrace::Log(image, "bind_rt");
 	image.usage.render_target = true;
 	RefreshImage(id);
 	CommitGpuWrite(image);
@@ -1796,6 +2141,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	if (!image.SafeToDownload() || !CanDownload(image)) {
 		return false;
 	}
+	ImageTrace::Log(image, "download_to_memory");
 	const auto range = image.info.data;
 	auto download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download)
 	                    .MapDownload(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
@@ -1842,6 +2188,190 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	return true;
 }
 
+// Diagnostic: with KYTY_PERF_STATS=1, every 60 flips print FPS, GPU waits and
+// cache sizes to stdout, to see what grows over time and what stalls the GPU thread.
+void TextureCache::PrintPerfStats(uint64_t flip) {
+	namespace DC = Common::DebugCounters;
+	namespace MS = Common::PerfStats;
+	static const bool enabled = std::getenv("KYTY_PERF_STATS") != nullptr;
+	constexpr uint64_t Window = 60;
+	if (!enabled) {
+		return;
+	}
+	struct Snapshot {
+		std::chrono::steady_clock::time_point time {};
+		uint64_t gpu_waits = 0, gpu_wait_ns = 0, meta_readbacks = 0, meta_ns = 0, submits = 0;
+		uint64_t draws = 0, dispatches = 0, evictions = 0, shaders = 0, lds_avoided = 0;
+		uint64_t sync_downloads = 0, sync_ns = 0, yield_sleeps = 0;
+		uint64_t gpu_thread_waits = 0, gpu_thread_wait_ns = 0, gpu_thread_busy_ns = 0;
+		uint64_t rb_fault_read = 0, rb_fault_write = 0, rb_gpu_thread = 0;
+		uint64_t ns_draw = 0, ns_dispatch = 0, ns_find_image = 0, ns_pipeline = 0;
+	};
+	static Snapshot previous {};
+	DC::SetEnabled(true); // the panel's counters only count while enabled
+	if (flip % Window != 0) {
+		return;
+	}
+	Snapshot now {};
+	now.time           = std::chrono::steady_clock::now();
+	now.gpu_waits      = DC::Get(DC::Counter::GpuWaits);
+	now.gpu_wait_ns    = DC::Get(DC::Counter::GpuWaitNs);
+	now.meta_readbacks = DC::Get(DC::Counter::ColorMetadataReadbacks);
+	now.meta_ns        = DC::Get(DC::Counter::ColorMetadataReadbackNs);
+	now.submits        = DC::Get(DC::Counter::QueueSubmits);
+	now.draws          = DC::Get(DC::Counter::Draws);
+	now.dispatches     = DC::Get(DC::Counter::Dispatches);
+	now.evictions      = DC::Get(DC::Counter::TextureEvictions);
+	now.shaders        = DC::Get(DC::Counter::ShadersCompiled);
+	now.lds_avoided    = MS::g_lds_stalls_avoided.load(std::memory_order_relaxed);
+	now.sync_downloads = MS::g_sync_downloads.load(std::memory_order_relaxed);
+	now.sync_ns        = MS::g_sync_wait_ns.load(std::memory_order_relaxed);
+	now.yield_sleeps   = MS::g_yield_sleeps.load(std::memory_order_relaxed);
+	now.gpu_thread_waits   = g_stats_waits_gpu_thread.load(std::memory_order_relaxed);
+	now.gpu_thread_wait_ns = g_stats_wait_ns_gpu_thread.load(std::memory_order_relaxed);
+	now.gpu_thread_busy_ns = DC::Get(DC::Counter::GpuThreadBusyNs);
+	now.rb_fault_read      = MS::g_rb_fault_read.load(std::memory_order_relaxed);
+	now.rb_fault_write     = MS::g_rb_fault_write.load(std::memory_order_relaxed);
+	now.rb_gpu_thread      = MS::g_rb_gpu_thread.load(std::memory_order_relaxed);
+	now.ns_draw            = MS::g_ns_draw.load(std::memory_order_relaxed);
+	now.ns_dispatch        = MS::g_ns_dispatch.load(std::memory_order_relaxed);
+	now.ns_find_image      = MS::g_ns_find_image.load(std::memory_order_relaxed);
+	now.ns_pipeline        = MS::g_ns_pipeline.load(std::memory_order_relaxed);
+	if (previous.time != std::chrono::steady_clock::time_point {}) {
+		const double seconds = std::chrono::duration<double>(now.time - previous.time).count();
+		size_t       images  = 0;
+		m_slot_images.ForEach([&](ImageId, const Image&) { ++images; });
+		const auto per_frame = [&](uint64_t a, uint64_t b) {
+			return static_cast<double>(a - b) / static_cast<double>(Window);
+		};
+		const auto ms = [](uint64_t a, uint64_t b) { return static_cast<double>(a - b) / 1e6; };
+		std::printf("PERF f=%" PRIu64 " fps=%.1f | per frame: draws=%.0f disp=%.0f submits=%.1f "
+		            "gpuWaits=%.1f (%.0f ms) drawThread=%.1f (%.0f ms, busy %.0f ms) syncReads=%.2f (%.0f ms) [faultRead=%.2f faultWrite=%.2f threadReads=%.2f] metaReads=%.2f (%.0f ms) "
+		            "ldsAvoided=%.1f | 60 frames: shaders=%" PRIu64 " evictions=%" PRIu64
+		            " sleeps=%" PRIu64 " | textures=%zu memMB=%" PRIu64 " gcFromMB=%" PRIu64
+		            " metas=%zu | ms en 60 frames: dibujos=%.0f disp=%.0f buscarTex=%.0f programas=%.0f\n",
+		            flip, static_cast<double>(Window) / seconds, per_frame(now.draws, previous.draws),
+		            per_frame(now.dispatches, previous.dispatches),
+		            per_frame(now.submits, previous.submits),
+		            per_frame(now.gpu_waits, previous.gpu_waits),
+		            ms(now.gpu_wait_ns, previous.gpu_wait_ns),
+		            per_frame(now.gpu_thread_waits, previous.gpu_thread_waits),
+		            ms(now.gpu_thread_wait_ns, previous.gpu_thread_wait_ns),
+		            ms(now.gpu_thread_busy_ns, previous.gpu_thread_busy_ns),
+		            per_frame(now.sync_downloads, previous.sync_downloads),
+		            ms(now.sync_ns, previous.sync_ns),
+		            per_frame(now.rb_fault_read, previous.rb_fault_read),
+		            per_frame(now.rb_fault_write, previous.rb_fault_write),
+		            per_frame(now.rb_gpu_thread, previous.rb_gpu_thread),
+		            per_frame(now.meta_readbacks, previous.meta_readbacks),
+		            ms(now.meta_ns, previous.meta_ns),
+		            per_frame(now.lds_avoided, previous.lds_avoided), now.shaders - previous.shaders,
+		            now.evictions - previous.evictions, now.yield_sleeps - previous.yield_sleeps,
+		            images, m_total_used_memory >> 20u, m_trigger_gc_memory >> 20u,
+		            m_surface_metas.size(), ms(now.ns_draw, previous.ns_draw),
+		            ms(now.ns_dispatch, previous.ns_dispatch),
+		            ms(now.ns_find_image, previous.ns_find_image),
+		            ms(now.ns_pipeline, previous.ns_pipeline));
+		if (flip % (Window * 5) == 0) {
+			std::printf("PERF_PAGES f=%" PRIu64 " stale=%" PRIu64 " prefetched=%" PRIu64
+			            " hits=%" PRIu64 "\n  syncDownloads:%s\n  writeFaults:%s\n  readFaults:%s\n",
+			            flip, MS::g_stale_reads.load(std::memory_order_relaxed),
+			            MS::g_prefetches.load(std::memory_order_relaxed),
+			            MS::g_prefetch_hits.load(std::memory_order_relaxed),
+			            MS::g_pages_sync_download.TakeTop(8).c_str(),
+			            MS::g_pages_fault_write.TakeTop(8).c_str(),
+			            MS::g_pages_fault_read.TakeTop(8).c_str());
+		}
+		std::fflush(stdout);
+	}
+	previous = now;
+}
+
+// Diagnostic only: with KYTY_DUMP_DIR set, the flip after `<dir>\trigger` appears copies mip 0 of
+// every GPU-written or volume color image to `<dir>\f<flip>_...bin` and deletes the trigger.
+void TextureCache::DumpImagesIfRequested(uint64_t flip) {
+	ImageTrace::g_flip.store(flip, std::memory_order_relaxed);
+	PrintPerfStats(flip);
+	static const char* dir = std::getenv("KYTY_DUMP_DIR");
+	if (dir == nullptr) {
+		return;
+	}
+	const std::string trigger = std::string(dir) + "\\trigger";
+	if (std::FILE* probe = std::fopen(trigger.c_str(), "rb"); probe != nullptr) {
+		std::fclose(probe);
+	} else {
+		return;
+	}
+	std::remove(trigger.c_str());
+	ImageTrace::g_buffer_dump_budget.store(16, std::memory_order_relaxed);
+
+	static constexpr uint64_t DUMP_BUDGET = 3ull << 30;
+	uint64_t                  total       = 0;
+	uint32_t                  count       = 0;
+	std::scoped_lock          lock {m_lock};
+	m_slot_images.ForEach([&](ImageId, Image& image) {
+		const auto& info = image.info;
+		if (image.backing.image == nullptr || info.IsDepth() || info.samples != 1 ||
+		    image.depth_id || vk::isCompressed(info.pixel_format) ||
+		    info.pixel_format == vk::Format::eUndefined) {
+			return;
+		}
+		if (!image.IsGpuModified() && !info.IsVolume()) {
+			return;
+		}
+		const uint32_t bpp    = vk::blockSize(info.pixel_format);
+		const uint32_t layers = info.IsVolume() ? 1u : std::max(1u, info.resources.layers);
+		const uint64_t size   = uint64_t {bpp} * info.extent.width * info.extent.height *
+		                      info.extent.depth * layers;
+		if (bpp == 0 || size == 0 || total + size > DUMP_BUDGET) {
+			return;
+		}
+		total += size;
+		count++;
+		vk::BufferImageCopy copy {};
+		copy.imageSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
+		copy.imageSubresource.mipLevel       = 0;
+		copy.imageSubresource.baseArrayLayer = 0;
+		copy.imageSubresource.layerCount     = layers;
+		copy.imageExtent                     = info.extent;
+		auto download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download)
+		                    .MapDownload(size, std::max<uint32_t>(bpp, 4));
+		copy.bufferOffset = download.offset;
+		image.Download(std::span(&copy, 1), download.buffer->Handle(), download.offset, size);
+		vk::BufferMemoryBarrier barrier {};
+		barrier.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+		barrier.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.buffer              = download.buffer->Handle();
+		barrier.offset              = download.offset;
+		barrier.size                = size;
+		m_scheduler.EndRendering();
+		m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                                               vk::PipelineStageFlagBits::eHost, {}, 0,
+		                                               nullptr, 1, &barrier, 0, nullptr);
+		char name[512];
+		std::snprintf(name, sizeof(name),
+		              "%s\\f%05" PRIu64 "_s%06" PRIu64 "_%ux%ux%u_L%u_fmt%u_bpp%u_g%u_%s_%s_%" PRIx64
+		              ".bin",
+		              dir, flip, image.serial, info.extent.width, info.extent.height,
+		              info.extent.depth, layers, static_cast<uint32_t>(info.pixel_format), bpp,
+		              static_cast<uint32_t>(info.guest_format), info.IsVolume() ? "3d" : "2d",
+		              image.usage.render_target ? "rt" : (image.IsGpuModified() ? "gpu" : "tex"),
+		              info.data.address);
+		m_scheduler.DeferPriorityOperation(
+		    [download = std::move(download), size, path = std::string(name)] {
+			    download.buffer->Invalidate(download.offset, size);
+			    if (std::FILE* out = std::fopen(path.c_str(), "wb"); out != nullptr) {
+				    std::fwrite(download.mapped, 1, static_cast<size_t>(size), out);
+				    std::fclose(out);
+			    }
+		    });
+	});
+	std::printf("KYTY_DUMP flip=%" PRIu64 " images=%u bytes=%" PRIu64 "\n", flip, count, total);
+	std::fflush(stdout);
+}
+
 uint64_t TextureCache::WriteBackTick(uint64_t address, uint64_t size) {
 	if (!m_readback_storage_images) {
 		return 0;
@@ -1865,6 +2395,7 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 		if (image.info.data.address != address) {
 			return;
 		}
+		ImageTrace::Log(image, "GPU_BUFFER_WRITE_INVALIDATES");
 		image.ClearGpuModified();
 		image.MarkBufferModified();
 	});
@@ -1949,6 +2480,7 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	for (const auto id: image_ids) {
 		auto& owner = m_slot_images[id];
 		if (owner.Overlaps(address, size)) {
+			ImageTrace::Log(owner, "CPU_WRITE_DIRTY");
 			owner.MarkCpuDirty();
 			UntrackImage(id);
 			continue;
@@ -2037,7 +2569,10 @@ void TextureCache::RunGarbageCollector() {
 	const auto collect = [&](bool allow_aggressive) {
 		bool     pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool     aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		uint64_t age        = 16;
+		// without memory pressure, keep images for ~5 s at 60 FPS instead of 16
+		// frames; at 17 FPS 16 frames is under a second. KYTY_GC_OLD_LIMITS=1 restores 16.
+		static const bool old_limits = std::getenv("KYTY_GC_OLD_LIMITS") != nullptr;
+		uint64_t age        = old_limits ? 16 : 300;
 		size_t   deletions  = 10;
 		if (aggressive) {
 			age       = 160;

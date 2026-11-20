@@ -9,6 +9,7 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -38,6 +39,18 @@ bool ScaleReferenceClock(uint64_t host_ticks, uint64_t host_frequency, uint64_t&
 	return true;
 }
 
+// KYTY_GPU_CLOCK_SCALE=N runs the GPU reference clock N times slower. Guest GPU timings are taken
+// when the emulator processes packets, so they include translation time; Unreal's dynamic
+// resolution reads them as GPU load and drops to its minimum screen percentage.
+static uint64_t GpuClockScale() {
+	static const uint64_t scale = [] {
+		const char* env = std::getenv("KYTY_GPU_CLOCK_SCALE");
+		const auto  n   = env != nullptr ? std::strtoull(env, nullptr, 10) : 1ull;
+		return n == 0 ? 1ull : n;
+	}();
+	return scale;
+}
+
 uint64_t ReadReferenceClock() {
 	const auto host_frequency = LibKernel::KernelGetTscFrequency();
 	const auto host_ticks     = LibKernel::KernelReadTsc();
@@ -45,6 +58,10 @@ uint64_t ReadReferenceClock() {
 	if (!ScaleReferenceClock(host_ticks, host_frequency, value)) {
 		EXIT("cannot scale host clock, ticks=0x%016" PRIx64 " frequency=%" PRIu64 "\n", host_ticks,
 		     host_frequency);
+	}
+	if (const auto scale = GpuClockScale(); scale > 1) {
+		static const uint64_t origin = value;
+		value = origin + (value - origin) / scale;
 	}
 	return value;
 }

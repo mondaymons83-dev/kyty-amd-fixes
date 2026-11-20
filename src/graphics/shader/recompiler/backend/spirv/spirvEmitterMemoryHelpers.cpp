@@ -289,11 +289,22 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
                                                  uint32_t array_index) {
 	MemoryResourceAccess access {.kind = mem.kind};
 	switch (mem.kind) {
-		case IR::ResourceKind::Lds:
+		case IR::ResourceKind::Lds: {
 			EnsureLdsStorage(state);
 			access.object_pointer = state.lds_variable;
 			access.length         = ConstantU32(state, LdsDwordCount(state));
+			// PPSA15210: AMD's proprietary compiler reused an LDS value read before a workgroup
+			// barrier for a read after it, so waves 1-3 of Unreal's tile classifier took a stale
+			// list offset (duplicated tiles: ghosts and checkerboard). Atomic loads cannot be
+			// reused across the barrier (same workaround as KytyPS5 #1624 bug 2).
+			// Tested 14-nov: the tile list got worse (4004 distinct entries instead of ~7000), so
+			// it stays off; KYTY_ATOMIC_LDS_LOADS=1 turns it on.
+			static const bool plain_lds_loads = std::getenv("KYTY_ATOMIC_LDS_LOADS") == nullptr;
+			if (!plain_lds_loads) {
+				access.memory_access = spv::MemoryAccessVolatileMask;
+			}
 			return access;
+		}
 		case IR::ResourceKind::Gds:
 			if (state.gds_variable == 0) {
 				ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Gds, mem.resource,

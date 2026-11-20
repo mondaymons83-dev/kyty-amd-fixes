@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <climits>
 #include <cstdio>
@@ -23,7 +24,10 @@
 #include <filesystem>
 #include <functional>
 #include <optional>
+#include <fstream>
+#include <iterator>
 #include <random>
+#include <string>
 #include <string_view>
 #include <system_error>
 #include <vector>
@@ -445,6 +449,80 @@ bool IsOpenDescriptor(int d) {
 	return file != nullptr && file->opened;
 }
 
+bool IsUnrealCommandLinePath(const std::string& guest_path) {
+	std::string lower(guest_path.size(), '\0');
+	std::ranges::transform(guest_path, lower.begin(),
+	                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	return lower == "/app0/ue4commandline.txt" || lower == "/app0/uecommandline.txt";
+}
+
+std::string AppendUnrealScreenPercentage(std::string command_line, uint32_t percentage) {
+	while (!command_line.empty() && (command_line.back() == '\n' || command_line.back() == '\r' ||
+	                                 command_line.back() == '\0')) {
+		command_line.pop_back();
+	}
+	// The engine takes the console variable from either form, depending on its version.
+	// KYTY_UE_CVARS="name=value,name=value" appends more console variables the same way.
+	std::vector<std::string> options;
+	if (percentage != 0) {
+		options.push_back("r.ScreenPercentage=" + std::to_string(percentage));
+	}
+	if (const char* extra = std::getenv("KYTY_UE_CVARS"); extra != nullptr) {
+		const std::string list = extra;
+		for (size_t begin = 0; begin < list.size();) {
+			const auto end = std::min(list.find(',', begin), list.size());
+			if (end > begin) {
+				options.push_back(list.substr(begin, end - begin));
+			}
+			begin = end + 1;
+		}
+	}
+	std::string joined;
+	for (const auto& option: options) {
+		joined += (joined.empty() ? "" : ",") + option;
+		command_line += " -ini:Engine:[SystemSettings]:" + option;
+	}
+	return joined.empty() ? command_line : command_line + " -dpcvars=" + joined;
+}
+
+// With --unreal-screen-percentage (KytyPS5 #2076), an Unreal Engine game's command line file is
+// served as a host copy in the temp directory with r.ScreenPercentage appended, so the engine
+// renders its scene at that share of the output and upscales it. The game's files are untouched.
+// Returns the copy's path, or nothing when the option is off, the path is another file, or the
+// file can't be read or written.
+static std::optional<std::filesystem::path> UnrealCommandLineCopy(
+    const std::string& guest_path, const std::filesystem::path& real_name) {
+	constexpr uint64_t MaxSize    = 64 * 1024;
+	const auto         percentage = Config::UnrealScreenPercentage();
+	if ((percentage == 0 && std::getenv("KYTY_UE_CVARS") == nullptr) ||
+	    !IsUnrealCommandLinePath(guest_path)) {
+		return std::nullopt;
+	}
+	std::error_code ec;
+	const auto      size = std::filesystem::file_size(real_name, ec);
+	if (ec || size > MaxSize) {
+		return std::nullopt;
+	}
+	std::ifstream in(real_name, std::ios::binary);
+	if (!in) {
+		return std::nullopt;
+	}
+	std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+	const auto  served = AppendUnrealScreenPercentage(std::move(content), percentage);
+	const auto  copy   = std::filesystem::temp_directory_path(ec) /
+	                  ("kyty_" + real_name.filename().string() + ".served");
+	if (ec) {
+		return std::nullopt;
+	}
+	std::ofstream out(copy, std::ios::binary | std::ios::trunc);
+	out.write(served.data(), static_cast<std::streamsize>(served.size()));
+	if (!out) {
+		return std::nullopt;
+	}
+	std::printf("Unreal command line served: %s\n", served.c_str());
+	return copy;
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	PRINT_NAME();
@@ -572,6 +650,14 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 
 			LOGF_COLOR(result ? Log::Color::Green : Log::Color::Red, "\tCreate: %s, %s\n",
 			           Common::PathToString(file->real_name).c_str(), result ? "[ok]" : "[fail]");
+		} else if (auto served = rw_mode == Common::File::Mode::Read
+		                             ? UnrealCommandLineCopy(file->name, file->real_name)
+		                             : std::nullopt) {
+			result = file->f.Open(*served, rw_mode);
+
+			LOGF_COLOR(result ? Log::Color::Green : Log::Color::Red, "\tOpen: %s, served copy %s, %s\n",
+			           Common::PathToString(file->real_name).c_str(),
+			           Common::PathToString(*served).c_str(), result ? "[ok]" : "[fail]");
 		} else {
 			result = file->f.Open(file->real_name, rw_mode);
 
@@ -1163,7 +1249,12 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 		return OK;
 	}
 
-	return StatHostPath(g_mount_points->ResolvePath(path), sb);
+	const auto real_file_name = g_mount_points->ResolvePath(path);
+	// A served Unreal command line reports the size of the copy the game will read.
+	if (const auto served = UnrealCommandLineCopy(path, real_file_name)) {
+		return StatHostPath(*served, sb);
+	}
+	return StatHostPath(real_file_name, sb);
 }
 
 int StatHostPath(const std::filesystem::path& real_file_name, FileStat* sb) {

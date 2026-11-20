@@ -67,6 +67,9 @@ public:
 	             const ImageSubresourceRange& destination_range);
 	void CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler);
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
+	// Clears a never-written image to zero once, so a read before the guest's first write sees
+	// zeros, as on the console, instead of whatever the host allocation held.
+	void ZeroFillOnce();
 
 	void MarkCpuDirty() {
 		m_cpu_dirty       = true;
@@ -167,12 +170,18 @@ private:
 	bool              m_maybe_cpu_dirty = false;
 	bool              m_gpu_modified    = false;
 	bool              m_buffer_modified = false;
+	bool              m_zero_filled     = false;
 };
 
 namespace ImageOps {
 
 void                                 Validate(const ImageInfo& info);
 [[nodiscard]] Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element);
+// Records one vkCmdCopyImage per region with a transfer barrier between them. AMD's Windows
+// driver drops the second aspect when depth and stencil are copied together into a
+// depth/stencil image with mips (KytyPS5#1624, bug 8).
+void CopyRegionsSeparately(vk::CommandBuffer command, vk::Image source, vk::Image destination,
+                           uint32_t count, const vk::ImageCopy* regions);
 
 } // namespace ImageOps
 

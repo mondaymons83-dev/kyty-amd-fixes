@@ -189,8 +189,37 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 	return thunk;
 }
 
+// KYTY_STUB_ERROR=Lib1,Lib2 makes missing functions of those libraries fail (negative result)
+// instead of returning 0. Games that poll an online service until it answers give up and stay
+// offline, where a silent 0 keeps them waiting forever (e.g. Ssl / NpSessionSignaling).
+static bool StubShouldFail(const std::string& name) {
+	static const std::string libs = [] {
+		const char* env = std::getenv("KYTY_STUB_ERROR");
+		return env != nullptr ? std::string(env) : std::string();
+	}();
+	if (libs.empty()) {
+		return false;
+	}
+	size_t start = 0;
+	while (start <= libs.size()) {
+		const auto end = libs.find(',', start);
+		const auto lib = libs.substr(start, end == std::string::npos ? std::string::npos : end - start);
+		if (!lib.empty() && name.find("[" + lib + "_") != std::string::npos) {
+			return true;
+		}
+		if (end == std::string::npos) {
+			break;
+		}
+		start = end + 1;
+	}
+	return false;
+}
+
 static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::UnresolvedImportCalls);
+	constexpr uint64_t STUB_ERROR = 0x80020003u; // negative as a 32-bit SCE result
+	const bool fail = record_id < g_stubbed_imports.size() &&
+	                  StubShouldFail(g_stubbed_imports[record_id].name);
 	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
 	if (log_index < 1024) {
 		if (record_id < g_stubbed_imports.size()) {
@@ -207,7 +236,7 @@ static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
 			     log_index, record_id);
 		}
 	}
-	return 0;
+	return fail ? STUB_ERROR : 0;
 }
 
 constexpr uint64_t SYSTEM_RESERVED  = 0x800000000u;

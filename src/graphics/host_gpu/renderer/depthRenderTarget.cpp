@@ -409,9 +409,8 @@ bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 		region.dstSubresource = region.srcSubresource;
 		region.extent = write_desc.info.extent;
 	}
-	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
-	                  destination.backing.image, vk::ImageLayout::eTransferDstOptimal,
-	                  count, regions.data());
+	ImageOps::CopyRegionsSeparately(command, source.backing.image, destination.backing.image, count,
+	                                regions.data());
 	return true;
 }
 

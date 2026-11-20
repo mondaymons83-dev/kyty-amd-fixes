@@ -157,7 +157,14 @@ struct VulkanImage {
 	VmaAllocation                allocation = nullptr;
 };
 
-
+// Layers a mesh shader can address, or 0 when every framebuffer layer is reachable. RADV reports
+// maxMeshOutputLayers = 8 and drops primitives on higher layers, so mesh draws into more layers
+// run in chunks of this size.
+[[nodiscard]] inline uint32_t MeshOutputLayerChunk(const GraphicContext& graphics) {
+	const auto layers = graphics.mesh_shader_properties.maxMeshOutputLayers;
+	const auto limit  = graphics.physical_device_properties.limits.maxFramebufferLayers;
+	return layers != 0 && layers < limit ? layers : 0u;
+}
 
 } // namespace Libs::Graphics
 

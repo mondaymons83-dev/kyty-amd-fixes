@@ -5,6 +5,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -23,6 +24,9 @@
 #include "kernel/memory.h"
 #include "loader/systemContent.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -30,6 +34,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <fmt/format.h>
 #include <limits>
 #include <ranges>
@@ -243,7 +248,8 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	        .robust_buffer_access   = graphics.robust_buffer_access_enabled,
 	        .r8_srgb_views          = graphics.r8_srgb_views,
 	        .r8g8_srgb_views        = graphics.r8g8_srgb_views,
-	        .relaxed_float          = Config::RelaxedShaderFloatEnabled()};
+	        .relaxed_float          = Config::RelaxedShaderFloatEnabled(),
+	        .mesh_output_layers     = MeshOutputLayerChunk(graphics)};
 }
 
 std::filesystem::path ShaderStorePath() {
@@ -322,6 +328,21 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 
 	const auto* stage = ShaderRecompiler::StageName(key.stage);
 	DumpShader(result.spirv, fmt::format("{}_{:016x}_{:016x}.spv", stage, key.hash, id));
+	// Diagnostic: KYTY_DUMP_DIR also keeps every compute module's SPIR-V and guest code.
+	if (const char* dump_dir = std::getenv("KYTY_DUMP_DIR"); dump_dir != nullptr) {
+		const auto base = std::filesystem::path(dump_dir) / "spv";
+		std::error_code ec;
+		std::filesystem::create_directories(base, ec);
+		const auto write = [](const std::filesystem::path& path, const void* data, size_t size) {
+			if (std::FILE* out = std::fopen(path.string().c_str(), "wb"); out != nullptr) {
+				std::fwrite(data, 1, size, out);
+				std::fclose(out);
+			}
+		};
+		const auto name = fmt::format("{}_{:016x}_{:016x}", stage, key.hash, id);
+		write(base / (name + ".spv"), result.spirv.data(), result.spirv.size() * sizeof(uint32_t));
+		write(base / (name + ".guest.bin"), function_code.data(), function_code.size_bytes());
+	}
 	ValidateShaderSpirv(stage, key.hash, result.spirv, profile.maintenance8);
 	auto& module = program.modules.emplace_back(ShaderModule {
 	    .id             = id,
@@ -464,6 +485,105 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	                          push_data_cursor));
 }
 
+// first-time pipeline compiles took 150-225 ms each and froze
+// the frame (Astro Bot: "No frames for 4 s"). Like yuzu/Cemu async shaders, compile on workers and
+// skip the draw until the pipeline exists. The workers get copies of the stage modules: program
+// module vectors can grow (and move their elements) while a job runs.
+struct PipelineCache::AsyncPipelines {
+	struct Job {
+		GraphicsPipelineKey         key;
+		std::array<ShaderModule, 4> modules;
+		std::array<bool, 4>         present {};
+	};
+	struct Done {
+		GraphicsPipelineKey key;
+		Pipeline            pipeline;
+	};
+
+	std::mutex                mutex;
+	std::condition_variable   ready;
+	std::deque<Job>           jobs;
+	std::vector<Done>         done;
+	bool                      stop = false;
+	std::vector<std::jthread> workers;
+
+	AsyncPipelines(GraphicContext& graphics, vk::PipelineCache driver_cache, uint32_t count) {
+		for (uint32_t i = 0; i < count; i++) {
+			workers.emplace_back([this, &graphics, driver_cache] { Run(graphics, driver_cache); });
+		}
+	}
+	~AsyncPipelines() { Stop(); }
+	KYTY_CLASS_NO_COPY(AsyncPipelines);
+
+	void Post(Job&& job) {
+		{
+			std::lock_guard lock(mutex);
+			jobs.push_back(std::move(job));
+		}
+		ready.notify_one();
+	}
+	// Drops queued jobs, lets running ones finish into `done` and joins the workers.
+	void Stop() {
+		{
+			std::lock_guard lock(mutex);
+			stop = true;
+			jobs.clear();
+		}
+		ready.notify_all();
+		workers.clear();
+	}
+
+private:
+	void Run(GraphicContext& graphics, vk::PipelineCache driver_cache) {
+		for (;;) {
+			Job job;
+			{
+				std::unique_lock lock(mutex);
+				ready.wait(lock, [this] { return stop || !jobs.empty(); });
+				if (stop) {
+					return;
+				}
+				job = std::move(jobs.front());
+				jobs.pop_front();
+			}
+			std::array<const ShaderModule*, 4> stages {};
+			for (uint32_t i = 0; i < stages.size(); i++) {
+				if (job.present[i]) {
+					stages[i] = &job.modules[i];
+				}
+			}
+			Pipeline pipeline;
+			{
+				Common::DebugCounters::ScopedTimer timer(
+				    Common::DebugCounters::Counter::PipelinesCreated,
+				    Common::DebugCounters::Counter::PipelineCreateNs,
+				    Common::DebugCounters::Peak::PipelineCreateNs);
+				CreatePipelineInternal(graphics, pipeline, job.key, stages, driver_cache);
+			}
+			std::lock_guard lock(mutex);
+			done.push_back({job.key, pipeline});
+		}
+	}
+};
+
+void PipelineCache::CollectAsyncPipelines() {
+	if (!m_async) {
+		return;
+	}
+	std::vector<AsyncPipelines::Done> finished;
+	{
+		std::lock_guard lock(m_async->mutex);
+		finished.swap(m_async->done);
+	}
+	for (auto& entry: finished) {
+		m_graphics_pipelines[entry.key] = entry.pipeline;
+		StorePipeline(entry.key);
+	}
+	if (!finished.empty()) {
+		CheckpointDriverCache();
+	}
+}
+
 PipelineCache::PipelineCache(GraphicContext&                         graphics,
                              ShaderRecompiler::IR::ImageHeapSource* image_heap,
                              const std::filesystem::path&           shader_store)
@@ -472,9 +592,26 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 	WarmUp(shader_store);
+	if (std::getenv("KYTY_SYNC_PIPELINES") == nullptr) {
+		// Half the hardware threads, at least 2 and at most 4: the guest and the GPU thread need the
+		// rest.
+		const auto threads = std::clamp(std::thread::hardware_concurrency() / 2u, 2u, 4u);
+		m_async            = std::make_unique<AsyncPipelines>(m_graphics, m_driver_cache, threads);
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Async pipelines: on ({} threads); a draw without its pipeline is skipped. "
+		    "KYTY_SYNC_PIPELINES=1 turns it off\n",
+		    threads));
+	}
 }
 
 PipelineCache::~PipelineCache() {
+	if (m_async) {
+		// Stop the workers before the pipelines and the driver cache they use go away; keep what
+		// they finished so it is destroyed (and stored) like the rest.
+		m_async->Stop();
+		CollectAsyncPipelines();
+		m_async.reset();
+	}
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& pipeline: pipelines | std::views::values) {
@@ -882,6 +1019,8 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
                                                             const DrawRenderState& state,
                                                             const DrawTargets&     targets) {
+	Common::PerfStats::ScopedNs perf_timer(Common::PerfStats::g_ns_pipeline);
+	CollectAsyncPipelines();
 	const auto* colors        = targets.colors;
 	const auto& depth         = targets.depth;
 	const auto  vertex_info   = state.VertexStages();
@@ -1051,6 +1190,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	auto [iter, inserted] = m_graphics_pipelines.try_emplace(key);
 	auto& pipeline        = iter->second;
 	if (!inserted) {
+		// Null while its async job runs: the caller skips the draw.
 		return pipeline;
 	}
 
@@ -1059,6 +1199,19 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		if (ps_active) {
 			ShaderDbgDumpInputInfo(ps_input_info);
 		}
+	}
+
+	if (m_async) {
+		AsyncPipelines::Job job;
+		job.key = key;
+		for (uint32_t i = 0; i < stages.size(); i++) {
+			if (stages[i] != nullptr) {
+				job.modules[i] = *stages[i];
+				job.present[i] = true;
+			}
+		}
+		m_async->Post(std::move(job));
+		return pipeline;
 	}
 
 	{
@@ -1075,6 +1228,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 
 PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
+	Common::PerfStats::ScopedNs perf_timer(Common::PerfStats::g_ns_pipeline);
 
 	const auto& module = *input_info.stage.module;
 

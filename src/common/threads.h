@@ -21,6 +21,8 @@ void SleepNano(uint64_t nanos);
 bool IsMainThread();
 // Unique per thread; never reused by another thread.
 int GetThreadIdUnique();
+// raises the calling thread above the guest's worker threads (Windows only).
+void RaiseCurrentThreadPriority();
 
 } // namespace Thread
 

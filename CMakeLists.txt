@@ -257,6 +257,8 @@ set(gpu_tiler_shader_names
 	demote_d16
 	color_transform
 	color_clear
+	color_apply
+	color_apply_3d
 )
 file(GLOB gpu_tiler_shader_includes CONFIGURE_DEPENDS "${gpu_tiler_shader_dir}/gpu_tiler_*.inc")
 foreach(shader_name IN LISTS gpu_tiler_shader_names)

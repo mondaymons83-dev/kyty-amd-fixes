@@ -145,6 +145,14 @@ uint32_t EmitInputComponentU32(EmitterState& state, IR::StageInputKind kind, uin
 }
 
 uint32_t EmitLocalInvocationIndex(EmitterState& state) {
+	if (state.lane_remap && state.subgroup_id_variable != 0) {
+		const auto* cs       = ShaderWorkgroupInput(state.program.stage, state.input_info);
+		const auto  subgroup = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), subgroup, state.subgroup_id_variable);
+		const auto base = EmitBinaryU32(state, spv::OpIMul, subgroup,
+		                                ConstantU32(state, cs->host_subgroup_size));
+		return EmitAddU32(state, base, EmitSubgroupLocalInvocationId(state));
+	}
 	const auto variable = InputVariableForKind(state, IR::StageInputKind::LocalInvocationIndex);
 	if (variable == 0) {
 		return ConstantU32(state, 0);

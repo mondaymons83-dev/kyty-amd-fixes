@@ -22,6 +22,9 @@ struct Profile {
 	bool r8g8_srgb_views = false;
 	// Native float ops: NaN, signed-zero and denormal results may differ from the guest.
 	bool relaxed_float = false;
+	// maxMeshOutputLayers when it is below the framebuffer layer limit (RADV: 8), else 0. Mesh
+	// shaders that write Layer then render one chunk of this many layers per NumWorkgroups.z.
+	uint32_t mesh_output_layers = 0;
 };
 
 inline constexpr Profile DefaultProfile {};

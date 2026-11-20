@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
+#include "common/perfStats.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
@@ -65,12 +66,17 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (WaitWriteBacks(fault_vaddr, fault_size)) {
 		return true;
 	}
+	Common::PerfStats::Bump(access == PageFaultAccess::Write ? Common::PerfStats::g_rb_fault_write
+	                                                           : Common::PerfStats::g_rb_fault_read);
 	if (access == PageFaultAccess::Write) {
+		Common::PerfStats::g_pages_fault_write.Add(fault_vaddr);
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
-		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
+		Common::PerfStats::g_pages_fault_read.Add(fault_vaddr);
+		m_buffer_cache.NoteGuestReadFault(fault_vaddr);
+		m_buffer_cache.ReadMemory(fault_vaddr, fault_size, false, true);
 	}
 	return true;
 }

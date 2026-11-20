@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/perfStats.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -1042,6 +1043,45 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	return true;
 }
 
+static bool MeshWritesLayer(const DrawRenderState& state) {
+	const auto& outputs = state.vertex_info[0].stage.module->info.info.outputs;
+	const auto writes = [&](ShaderRecompiler::IR::StageOutputKind kind) {
+		return std::ranges::any_of(outputs, [kind](const ShaderRecompiler::IR::StageOutput& output) {
+			return output.kind == kind;
+		});
+	};
+	// Must match MeshLayerChunk in the SPIR-V emitter.
+	return writes(ShaderRecompiler::IR::StageOutputKind::Layer) &&
+	       !writes(ShaderRecompiler::IR::StageOutputKind::ViewportIndex);
+}
+
+// The draw's render state over layers [chunk * layer_chunk, chunk * layer_chunk + layer_chunk).
+RenderState RenderExecutor::LayerChunkRenderState(const RenderState& full, uint32_t chunk,
+                                                  uint32_t layer_chunk) {
+	auto&      cache = m_context.GetTextureCache();
+	const auto first = chunk * layer_chunk;
+	const auto count = std::min(layer_chunk, full.num_layers - first);
+	const auto chunk_view = [&](ImageViewInfo view) {
+		view.base_layer += first;
+		view.layer_count = count;
+		view.type = count == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
+		return view;
+	};
+	RenderState state = full;
+	state.num_layers  = count;
+	for (uint32_t i = 0; i < m_targets.color_count; i++) {
+		const auto& target = m_targets.colors[i];
+		state.color_attachments[target.target_slot].image_view =
+		    cache.GetImage(target.image_id).FindView(chunk_view(target.desc.view_info));
+	}
+	if (m_targets.depth.image_id) {
+		const auto& depth = m_targets.depth;
+		state.depth_stencil_attachment.image_view =
+		    cache.GetImage(depth.image_id).FindView(chunk_view(depth.desc.view_info));
+	}
+	return state;
+}
+
 void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
                                          const DrawRenderState& state, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source) {
@@ -1130,6 +1170,41 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		EXIT_IF((args_buffer.second & 3u) != 0);
 	}
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, m_targets);
+	if (!pipeline.pipeline) {
+		// Async pipelines: still compiling on a worker. Skip this draw rather than stall the frame;
+		// the next draw with the same state finds it ready.
+		return;
+	}
+	// Diagnostic (KYTY_TRACE): the shaders, inputs and targets of draws into a traced extent.
+	for (uint32_t i = 0; i < m_targets.color_count && ImageTrace::Enabled(); i++) {
+		const auto& target = m_targets.colors[i].desc.info;
+		if (!ImageTrace::MatchesExtent(target.extent.width, target.extent.height)) {
+			continue;
+		}
+		const auto ps_hash = state.ps_active ? state.ps_input_info.stage.module->info.shader_hash : 0;
+		const auto vs_hash = state.vertex_info[0].stage.module->info.shader_hash;
+		std::printf("TRACE f=%" PRIu64 " DRAW PS=%016" PRIx64 " VS=%016" PRIx64
+		            " target%u addr=%" PRIx64 " fmt%u count=%u inst=%u\n",
+		            ImageTrace::g_flip.load(std::memory_order_relaxed), ps_hash, vs_hash, i,
+		            target.data.address, static_cast<uint32_t>(target.pixel_format),
+		            draw.index_count, draw.instance_count);
+		if (state.ps_active) {
+			const auto& program   = state.ps_input_info.stage.module->info;
+			const auto& resources = *state.ps_input_info.stage.resources;
+			for (uint32_t t = 0; t < program.info.images.size(); t++) {
+				const auto r = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[t]);
+				std::printf("TRACE   PS texture[%u] addr=%010" PRIx64 " guest_fmt=%u %ux%u depth=%u "
+				            "tile=%u written=%d\n",
+				            t, r.Base40(), static_cast<uint32_t>(r.Format()),
+				            static_cast<uint32_t>(r.Width5()) + 1u,
+				            static_cast<uint32_t>(r.Height5()) + 1u,
+				            static_cast<uint32_t>(r.Depth()) + 1u,
+				            static_cast<uint32_t>(r.TileMode()),
+				            program.info.images[t].written ? 1 : 0);
+			}
+		}
+		break;
+	}
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering = AcquireRenderTargets(buffer, m_targets.colors, m_targets.color_count,
 	                                            m_targets.depth, feedback_aspects, stages);
@@ -1190,8 +1265,32 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	}
 
 	auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();
+	// A mesh shader that writes Layer reaches only MeshOutputLayerChunk layers on some hosts; draw
+	// the targets in chunks of that many layers, NumWorkgroups.z selecting the chunk.
+	const auto layer_chunk = mesh_active && !mesh_task && MeshWritesLayer(state)
+	                             ? MeshOutputLayerChunk(m_context.GetGraphics())
+	                             : 0u;
+	const uint32_t layer_chunks =
+	    layer_chunk != 0 ? (rendering.num_layers + layer_chunk - 1u) / layer_chunk : 1u;
+	const auto max_viewports = std::min<uint32_t>(
+	    m_context.GetGraphics().physical_device_properties.limits.maxViewports, 16u);
+	if (layer_chunks > limits.maxMeshWorkGroupCount[2] || layer_chunks > max_viewports ||
+	    static_cast<uint64_t>(mesh_groups) * draw.instance_count * layer_chunks >
+	        limits.maxMeshWorkGroupTotalCount) {
+		EXIT("layered mesh draw exceeds host workgroup limits: %ux%ux%u\n", mesh_groups,
+		     draw.instance_count, layer_chunks);
+	}
 	UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), m_targets.depth,
 	                           rendering);
+	if (layer_chunks > 1) {
+		// Each chunk's primitives select ViewportIndex = chunk, so every chunk sees viewport 0.
+		std::array<vk::Viewport, 16> viewports {};
+		std::array<vk::Rect2D, 16>   scissors {};
+		viewports.fill(dynamic_state.viewports[0]);
+		scissors.fill(dynamic_state.scissors[0]);
+		dynamic_state.SetViewports(std::span {viewports}.first(layer_chunks));
+		dynamic_state.SetScissors(std::span {scissors}.first(layer_chunks));
+	}
 	dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
 	dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
 
@@ -1209,12 +1308,21 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		buffer.EndRendering();
 		ShaderWriteHazardBarrier(vk_buffer, shader_write_stages);
 	}
-	buffer.BeginRendering(rendering);
+	buffer.BeginRendering(layer_chunks > 1 ? LayerChunkRenderState(rendering, 0, layer_chunk)
+	                                       : rendering);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
 	if (mesh_task) {
 		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
+	} else if (layer_chunks > 1) {
+		// The occlusion query covers the first chunk; a query cannot span render passes.
+		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+		occlusion_queries.End(vk_buffer, occlusion_query);
+		for (uint32_t chunk = 1; chunk < layer_chunks; chunk++) {
+			buffer.BeginRendering(LayerChunkRenderState(rendering, chunk, layer_chunk));
+			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, chunk + 1u);
+		}
 	} else if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else if (args_buffer.first == nullptr) {
@@ -1226,7 +1334,9 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		vk_buffer.drawIndirect(args_buffer.first->Handle(), args_buffer.second,
 		                       emit.indirect.count, emit.indirect.stride);
 	}
-	occlusion_queries.End(vk_buffer, occlusion_query);
+	if (layer_chunks == 1) {
+		occlusion_queries.End(vk_buffer, occlusion_query);
+	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
 
@@ -1272,6 +1382,7 @@ static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        
 
 bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	Common::PerfStats::ScopedNs perf_timer(Common::PerfStats::g_ns_draw);
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
@@ -1363,6 +1474,7 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	Common::PerfStats::ScopedNs perf_timer(Common::PerfStats::g_ns_draw);
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();

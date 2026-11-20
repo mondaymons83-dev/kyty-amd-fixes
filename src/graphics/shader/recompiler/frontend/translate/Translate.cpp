@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <unordered_map>
 #include <utility>
 
@@ -739,6 +740,7 @@ void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlo
 		const bool zero = kind == CFG::BranchCondition::SccZero ||
 		                  kind == CFG::BranchCondition::VccZero ||
 		                  kind == CFG::BranchCondition::ExecZero;
+		const bool exec_skip = kind == CFG::BranchCondition::ExecZero;
 		if (zero) kind = static_cast<CFG::BranchCondition>(static_cast<int>(kind) + 1);
 		IR::U1 condition;
 		switch (kind) {
@@ -752,7 +754,8 @@ void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlo
 				break;
 			default: EXIT("block %u has an invalid native branch condition", source.id);
 		}
-		const auto vote = IR::U1(ir.Emit(IR::ValueOpcode::ConditionRef, {condition}, kind));
+		const auto vote = IR::U1(ir.Emit(IR::ValueOpcode::ConditionRef, {condition},
+		                                 exec_skip ? CFG::BranchCondition::ExecSkip : kind));
 		return zero ? ir.LogicalNot(vote) : vote;
 	};
 	const auto expression = [&](auto&& self, uint32_t index) -> IR::U1 {
@@ -784,9 +787,38 @@ void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlo
 		return;
 	}
 	if (term.kind == CFG::TerminatorKind::ConditionalBranch) {
-		const auto condition = term.expression != UINT32_MAX
-		                           ? expression(expression, term.expression)
-		                           : native_condition(term.condition);
+		auto condition = term.expression != UINT32_MAX ? expression(expression, term.expression)
+		                                               : native_condition(term.condition);
+		// (PPSA15210 sun light tiles): lanes outside EXEC still run a wave-voted
+		// branch body in SPIR-V, and their side effects corrupted Unreal's tile passes (isolated
+		// repro: only sending inactive lanes past the body fixes the list). For a forward
+		// selection on VCC/SCC/EXEC, inactive lanes now go straight to the merge block; active
+		// lanes keep the wave vote, so the console's behaviour is unchanged for them.
+		// KYTY_WAVE_INACTIVE_IN_BODY=1 restores the old behaviour.
+		static const bool keep_inactive = std::getenv("KYTY_WAVE_INACTIVE_IN_BODY") != nullptr;
+		// Structured selections keep the native kind inside their expression (maybe under a Not).
+		auto kind = term.condition;
+		if (term.expression != UINT32_MAX) {
+			auto node = graph.expressions.at(term.expression);
+			if (node.op == CFG::ConditionExpression::Op::Not) {
+				node = graph.expressions.at(node.lhs);
+			}
+			kind = node.op == CFG::ConditionExpression::Op::Native
+			           ? static_cast<CFG::BranchCondition>(node.lhs)
+			           : CFG::BranchCondition::Unknown;
+		}
+		const bool voted =
+		    kind == CFG::BranchCondition::VccZero || kind == CFG::BranchCondition::VccNonZero ||
+		    kind == CFG::BranchCondition::SccZero || kind == CFG::BranchCondition::SccNonZero ||
+		    kind == CFG::BranchCondition::ExecNonZero;
+		if (!keep_inactive && voted && !term.loop_header && term.continue_block == UINT32_MAX &&
+		    term.merge_block != UINT32_MAX) {
+			if (term.true_block == term.merge_block) {
+				condition = ir.LogicalOr(condition, ir.LogicalNot(ir.GetExec()));
+			} else if (term.false_block == term.merge_block) {
+				condition = ir.LogicalAnd(condition, ir.GetExec());
+			}
+		}
 		info.condition = condition;
 		ir.Emit(IR::ValueOpcode::Reference, {condition});
 	}

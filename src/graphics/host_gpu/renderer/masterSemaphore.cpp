@@ -1,4 +1,8 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
+#include "graphics/guest_gpu/graphicsRun.h"
+
+#include <atomic>
+#include <chrono>
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -34,6 +38,12 @@ void MasterSemaphore::Refresh() {
 	}
 }
 
+// KYTY_UPLOAD_STATS: wall time spent in semaphore waits, split by the guest GPU thread and the rest.
+std::atomic<uint64_t> g_stats_wait_ns_gpu_thread {0};
+std::atomic<uint64_t> g_stats_wait_ns_other {0};
+std::atomic<uint64_t> g_stats_waits_gpu_thread {0};
+std::atomic<uint64_t> g_stats_waits_other {0};
+
 void MasterSemaphore::Wait(uint64_t tick) {
 	if (IsFree(tick)) {
 		return;
@@ -50,8 +60,19 @@ void MasterSemaphore::Wait(uint64_t tick) {
 
 	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
 	                                         Common::DebugCounters::Counter::GpuWaitNs);
+	const auto wait_start = std::chrono::steady_clock::now();
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	const auto waited = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                              std::chrono::steady_clock::now() - wait_start)
+	                                              .count());
+	if (GuestGpu::IsGpuThread()) {
+		g_stats_wait_ns_gpu_thread.fetch_add(waited, std::memory_order_relaxed);
+		g_stats_waits_gpu_thread.fetch_add(1, std::memory_order_relaxed);
+	} else {
+		g_stats_wait_ns_other.fetch_add(waited, std::memory_order_relaxed);
+		g_stats_waits_other.fetch_add(1, std::memory_order_relaxed);
+	}
 	Refresh();
 }
 

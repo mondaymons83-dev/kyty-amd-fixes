@@ -185,6 +185,8 @@ private:
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
 	                                               std::span<PreparedBindings* const> stages = {});
+	[[nodiscard]] RenderState LayerChunkRenderState(const RenderState& full, uint32_t chunk,
+	                                                uint32_t layer_chunk);
 	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer);
 	[[nodiscard]] bool        ConsumeMetadataColorOperation(CommandBuffer& buffer);
 	void                      BindImage(ImageId id, bool storage);
